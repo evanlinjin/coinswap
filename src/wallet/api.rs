@@ -1871,8 +1871,6 @@ impl Wallet {
         manually_selected_outpoints: Option<Vec<OutPoint>>,
         excluded_outpoints: Option<Vec<OutPoint>>,
     ) -> Result<Vec<(ListUnspentResultEntry, UTXOSpendInfo)>, WalletError> {
-        // P2TR input weight breakdown:
-        // Non-witness data (multiplied by 4):
         // Long-term feerate (sat/vB) used by `LowestFee` and `ChangePolicy::min_value_and_waste`
         // to amortize the cost of spending a change output. Kept at 10 sat/vB to match the
         // prior code's policy intent: change worth less than what it would cost to spend later
@@ -1881,10 +1879,6 @@ impl Wallet {
         // P2WPKH dust threshold (sats). Coinswap change outputs are always P2TR (whose own dust
         // limit is 330) so this is conservative but matches the prior behaviour.
         const MIN_CHANGE_VALUE: u64 = 294;
-        // BnB iteration cap. Generous (orders of magnitude above 2^N for realistic
-        // candidate counts) so the branch-and-bound search always converges before
-        // hitting the cap; the cap exists only as a runaway-loop safety bound.
-        const BNB_MAX_ROUNDS: usize = 1_000_000;
 
         let locked_utxos = self.list_lock_unspent()?;
         let excluded: std::collections::HashSet<OutPoint> =
@@ -2001,87 +1995,45 @@ impl Wallet {
         let mut last_error: Option<WalletError> = None;
 
         for (utxo_type, unspents) in piles {
-            // Partition manual UTXOs out before grouping so they form their own pinned group
-            // (matches the prior behaviour: address-mates of a manual UTXO are still grouped
-            // as a reused address, without the manual one).
-            let (manual_utxos, non_manual): (Vec<_>, Vec<_>) = unspents
+            // Adapt wallet/RPC types into the stripped-down PileUtxo struct so the
+            // grouping + selection logic can live in a unit-testable free function.
+            let pile: Vec<PileUtxo> = unspents
                 .iter()
-                .cloned()
-                .partition(|(u, _)| manual.contains(&OutPoint::new(u.txid, u.vout)));
-
-            // Group non-manual UTXOs by receiving address. Reused groups are exploited for
-            // privacy (already publicly linked → spend together for free).
-            let mut address_groups: HashMap<String, Vec<(ListUnspentResultEntry, UTXOSpendInfo)>> =
-                HashMap::new();
-            for (utxo, spend_info) in non_manual {
-                let key = utxo
-                    .address
-                    .as_ref()
-                    .map(|a| a.clone().assume_checked().to_string())
-                    .unwrap_or_else(|| format!("script_{}", utxo.script_pub_key));
-                address_groups
-                    .entry(key)
-                    .or_default()
-                    .push((utxo, spend_info));
-            }
-            let (mut reused, mut singles): (Vec<_>, Vec<_>) =
-                address_groups.into_values().partition(|g| g.len() > 1);
-
-            // Spend smaller reused groups first (preserves prior ordering).
-            reused.sort_by_key(|g| g.iter().map(|(u, _)| u.amount.to_sat()).sum::<u64>());
-            singles.sort_by_key(|g| g.iter().map(|(u, _)| u.amount.to_sat()).sum::<u64>());
-
-            // Final group order: [manual?, reused (asc), singles…]. Indices into this vec are
-            // used as `Candidate` indices throughout.
-            let mut groups: Vec<Vec<(ListUnspentResultEntry, UTXOSpendInfo)>> = Vec::new();
-            let manual_present = !manual_utxos.is_empty();
-            if manual_present {
-                groups.push(manual_utxos);
-            }
-            let pre_select_end = groups.len() + reused.len();
-            groups.extend(reused);
-            groups.extend(singles);
-
-            // Each `Candidate` represents a group (one or more UTXOs spent atomically). The
-            // `input_count > 1` case is exactly the `bdk_coin_select` feature that lets the
-            // reused-address policy ride on top of BnB without a hand-rolled two-phase loop.
-            let candidates: Vec<Candidate> = groups
-                .iter()
-                .map(|g| {
-                    let value: u64 = g.iter().map(|(u, _)| u.amount.to_sat()).sum();
-                    let weight: u64 = g
-                        .iter()
-                        .map(|(_, info)| TXIN_BASE_WEIGHT + info.estimate_witness_size() as u64)
-                        .sum();
-                    Candidate {
-                        value,
-                        weight,
-                        input_count: g.len(),
-                        is_segwit: true,
-                    }
+                .map(|(u, info)| PileUtxo {
+                    outpoint: OutPoint::new(u.txid, u.vout),
+                    value: u.amount.to_sat(),
+                    witness_size: info.estimate_witness_size() as u64,
+                    address_key: u
+                        .address
+                        .as_ref()
+                        .map(|a| a.clone().assume_checked().to_string())
+                        .unwrap_or_else(|| format!("script_{}", u.script_pub_key)),
+                    is_manual: manual.contains(&OutPoint::new(u.txid, u.vout)),
                 })
                 .collect();
 
-            let mut selector = CoinSelector::new(&candidates);
-
-            // Force-include manual + reused groups, smallest reused first, until target met.
-            for i in 0..pre_select_end {
-                selector.select(i);
-                if selector.is_target_met(target) {
-                    break;
+            match select_from_pile(pile, target, long_term_feerate, change_policy) {
+                Ok(outpoints) => {
+                    // Map selected outpoints back to (ListUnspentResultEntry, UTXOSpendInfo).
+                    let by_op: HashMap<OutPoint, usize> = unspents
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (u, _))| (OutPoint::new(u.txid, u.vout), i))
+                        .collect();
+                    let selected: Vec<(ListUnspentResultEntry, UTXOSpendInfo)> = outpoints
+                        .into_iter()
+                        .map(|op| {
+                            let i = by_op
+                                .get(&op)
+                                .copied()
+                                .expect("selector returned outpoint not in input pile");
+                            unspents[i].clone()
+                        })
+                        .collect();
+                    log::info!("Selected {} {utxo_type} UTXOs", selected.len());
+                    return Ok(selected);
                 }
-            }
-
-            // Top up via BnB across the single-UTXO addresses if needed.
-            if !selector.is_target_met(target) {
-                let metric = LowestFee {
-                    target,
-                    long_term_feerate,
-                    change_policy,
-                };
-                if selector.run_bnb(metric, BNB_MAX_ROUNDS).is_err()
-                    && selector.select_until_target_met(target).is_err()
-                {
+                Err(missing) => {
                     let available = if utxo_type == "regular" {
                         regular_total
                     } else {
@@ -2089,19 +2041,12 @@ impl Wallet {
                     };
                     last_error = Some(WalletError::InsufficientFund {
                         available,
-                        required: amount.to_sat() + selector.missing(target),
+                        required: amount.to_sat() + missing,
                     });
                     log::warn!("Coin selection with {utxo_type} UTXOs failed to meet target");
                     continue;
                 }
             }
-
-            let selected: Vec<(ListUnspentResultEntry, UTXOSpendInfo)> = selector
-                .apply_selection(&groups)
-                .flat_map(|g| g.iter().cloned())
-                .collect();
-            log::info!("Selected {} {utxo_type} UTXOs", selected.len());
-            return Ok(selected);
         }
 
         Err(last_error.unwrap_or_else(|| WalletError::InsufficientFund {
@@ -2557,5 +2502,407 @@ impl Wallet {
                 thread::sleep(Duration::from_secs(1));
             }
         }
+    }
+}
+
+// BnB iteration cap. Generous (orders of magnitude above 2^N for realistic
+// candidate counts) so the branch-and-bound search always converges before
+// hitting the cap; the cap exists only as a runaway-loop safety bound.
+const BNB_MAX_ROUNDS: usize = 1_000_000;
+
+/// Run grouped coin selection on a pre-built `Candidate` list.
+///
+/// Force-includes candidates `[0..pre_select_end]` in order (with early-exit once the
+/// target is met), then runs branch-and-bound with the [`LowestFee`] metric across the
+/// remaining candidates to top up the selection if needed. Returns the original indices
+/// of the selected candidates on success, or the missing amount in satoshis on failure.
+///
+/// This is the pure core of [`Wallet::coin_select`] - extracted so it can be unit-tested
+/// without spinning up a wallet, RPC, or regtest environment.
+fn select_grouped(
+    candidates: &[Candidate],
+    pre_select_end: usize,
+    target: Target,
+    long_term_feerate: BdkFeeRate,
+    change_policy: ChangePolicy,
+) -> Result<Vec<usize>, u64> {
+    let mut selector = CoinSelector::new(candidates);
+
+    for i in 0..pre_select_end {
+        selector.select(i);
+        if selector.is_target_met(target) {
+            break;
+        }
+    }
+
+    if !selector.is_target_met(target) {
+        let metric = LowestFee {
+            target,
+            long_term_feerate,
+            change_policy,
+        };
+        if selector.run_bnb(metric, BNB_MAX_ROUNDS).is_err()
+            && selector.select_until_target_met(target).is_err()
+        {
+            return Err(selector.missing(target));
+        }
+    }
+
+    Ok(selector.selected_indices().iter().copied().collect())
+}
+
+/// Minimal description of a UTXO needed for [`select_from_pile`].
+///
+/// Decouples selection from RPC types (`ListUnspentResultEntry`) and wallet types
+/// (`UTXOSpendInfo`) so the grouping / sort / candidate-build / mapping logic can
+/// be unit-tested without spinning up a wallet.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct PileUtxo {
+    /// Outpoint identifying this UTXO.
+    pub(crate) outpoint: OutPoint,
+    /// Value in satoshis.
+    pub(crate) value: u64,
+    /// Witness/scriptSig satisfaction weight (the per-input weight bdk_coin_select
+    /// adds on top of `TXIN_BASE_WEIGHT`).
+    pub(crate) witness_size: u64,
+    /// Stable string key used to group address-mates. Same SPK ⇒ same key.
+    pub(crate) address_key: String,
+    /// Whether this UTXO was manually requested by the caller.
+    pub(crate) is_manual: bool,
+}
+
+/// Run coin selection over one pile of UTXOs, applying coinswap's policy on top
+/// of `bdk_coin_select`'s BnB.
+///
+/// Policy:
+/// 1. Manual UTXOs are pulled into a single pinned group placed at the front,
+///    so address-mates of a manual UTXO still group as a reused address (without
+///    the manual one).
+/// 2. Non-manual UTXOs are grouped by `address_key`. Reused groups (size > 1) and
+///    single-UTXO addresses are partitioned; reused groups are pre-selected in
+///    ascending value order to spend already-publicly-linked coins first.
+/// 3. If pre-selection meets the target, BnB never runs.
+/// 4. Otherwise [`LowestFee`] BnB tops up across the single-UTXO addresses.
+///
+/// Returns selected outpoints in group order on success, or the missing amount
+/// in sats on failure.
+pub(crate) fn select_from_pile(
+    pile: Vec<PileUtxo>,
+    target: Target,
+    long_term_feerate: BdkFeeRate,
+    change_policy: ChangePolicy,
+) -> Result<Vec<OutPoint>, u64> {
+    // (1) Partition manual UTXOs out before grouping.
+    let (manual, non_manual): (Vec<_>, Vec<_>) = pile.into_iter().partition(|u| u.is_manual);
+
+    // (2) Group non-manual UTXOs by receiving-address key; partition reused vs single.
+    let mut by_addr: HashMap<String, Vec<PileUtxo>> = HashMap::new();
+    for u in non_manual {
+        by_addr.entry(u.address_key.clone()).or_default().push(u);
+    }
+    let (mut reused, mut singles): (Vec<_>, Vec<_>) =
+        by_addr.into_values().partition(|g| g.len() > 1);
+
+    // Spend smaller reused groups first (preserves prior behaviour).
+    reused.sort_by_key(|g| g.iter().map(|u| u.value).sum::<u64>());
+    singles.sort_by_key(|g| g.iter().map(|u| u.value).sum::<u64>());
+
+    // Group order: [manual?, reused (asc), singles…]. Indices here = candidate indices.
+    let mut groups: Vec<Vec<PileUtxo>> = Vec::new();
+    if !manual.is_empty() {
+        groups.push(manual);
+    }
+    let pre_select_end = groups.len() + reused.len();
+    groups.extend(reused);
+    groups.extend(singles);
+
+    // Build one `Candidate` per group; `input_count > 1` is what lets the reused-
+    // address privacy policy ride atop BnB as an atomic include/exclude decision.
+    let candidates: Vec<Candidate> = groups
+        .iter()
+        .map(|g| Candidate {
+            value: g.iter().map(|u| u.value).sum(),
+            weight: g.iter().map(|u| TXIN_BASE_WEIGHT + u.witness_size).sum(),
+            input_count: g.len(),
+            is_segwit: true,
+        })
+        .collect();
+
+    let indices = select_grouped(
+        &candidates,
+        pre_select_end,
+        target,
+        long_term_feerate,
+        change_policy,
+    )?;
+
+    Ok(indices
+        .into_iter()
+        .flat_map(|i| groups[i].iter().map(|u| u.outpoint))
+        .collect())
+}
+
+#[cfg(test)]
+mod selector_tests {
+    //! Unit tests for [`select_from_pile`] — the coinswap-specific policy layer
+    //! (address grouping, manual pinning, reused-first ordering, outpoint mapping)
+    //! that sits on top of `bdk_coin_select`'s BnB. These tests do **not** exist
+    //! to validate `bdk_coin_select` itself; they exist to catch regressions in
+    //! the policy and the data shuffling around the library call.
+
+    use super::{
+        select_from_pile, BdkFeeRate, ChangePolicy, DrainWeights, PileUtxo, Target, TargetFee,
+    };
+    use bdk_coin_select::{
+        TargetOutputs, TR_KEYSPEND_SATISFACTION_WEIGHT, TR_SPK_WEIGHT, TXOUT_BASE_WEIGHT,
+    };
+    use bitcoin::{hashes::Hash, OutPoint, Txid};
+    use std::collections::HashSet;
+
+    fn op(n: u8) -> OutPoint {
+        // Deterministic distinct outpoints: txid bytes = [n; 32], vout = 0.
+        OutPoint::new(Txid::from_byte_array([n; 32]), 0)
+    }
+
+    fn pile_utxo(n: u8, value: u64, address: &str, is_manual: bool) -> PileUtxo {
+        PileUtxo {
+            outpoint: op(n),
+            value,
+            witness_size: TR_KEYSPEND_SATISFACTION_WEIGHT,
+            address_key: address.to_string(),
+            is_manual,
+        }
+    }
+
+    fn standard_target(value_sat: u64) -> Target {
+        // TXOUT_BASE_WEIGHT and TR_SPK_WEIGHT are already in weight units; no `* 4`.
+        let p2tr_txout_weight = TXOUT_BASE_WEIGHT + TR_SPK_WEIGHT;
+        Target {
+            fee: TargetFee::from_feerate(BdkFeeRate::from_sat_per_vb(10.0)),
+            outputs: TargetOutputs::fund_outputs([(p2tr_txout_weight, value_sat)]),
+        }
+    }
+
+    fn change_policy() -> ChangePolicy {
+        let ltf = BdkFeeRate::from_sat_per_vb(10.0);
+        ChangePolicy::min_value_and_waste(
+            DrainWeights::TR_KEYSPEND,
+            294,
+            BdkFeeRate::from_sat_per_vb(10.0),
+            ltf,
+        )
+    }
+
+    fn ltf() -> BdkFeeRate {
+        BdkFeeRate::from_sat_per_vb(10.0)
+    }
+
+    // ---------------------------------------------------------------------
+    // 1. Reused-address grouping: address-mates ARE spent together; non-mates
+    //    are not bundled into the same atomic group.
+    // ---------------------------------------------------------------------
+    #[test]
+    fn reused_address_group_is_spent_together() {
+        // Two UTXOs at address "A" (8k + 9k = 17k), one UTXO at "B" (50k).
+        // Target 15k can be met by either A-group OR B alone. The reused-first
+        // policy must pick A's *both* UTXOs (not just one of them, since they
+        // are an atomic group).
+        let pile = vec![
+            pile_utxo(1, 8_000, "A", false),
+            pile_utxo(2, 9_000, "A", false),
+            pile_utxo(3, 50_000, "B", false),
+        ];
+        let out = select_from_pile(pile, standard_target(15_000), ltf(), change_policy())
+            .expect("selection should succeed");
+        let set: HashSet<_> = out.iter().copied().collect();
+        // Both A-UTXOs must be present (atomic group).
+        assert!(set.contains(&op(1)), "A's first UTXO must be selected");
+        assert!(set.contains(&op(2)), "A's second UTXO must be selected");
+        // B must NOT be selected — the reused A-group alone covers the target.
+        assert!(!set.contains(&op(3)), "B should not be touched");
+    }
+
+    // ---------------------------------------------------------------------
+    // 2. Reused groups are tried smallest-first.
+    // ---------------------------------------------------------------------
+    #[test]
+    fn smaller_reused_group_is_preferred() {
+        // Two reused groups: smallA = 10k+10k = 20k; bigB = 100k+100k = 200k.
+        // Target 15k — both groups individually meet it. Smallest-first means
+        // smallA wins; bigB stays put.
+        let pile = vec![
+            pile_utxo(1, 10_000, "smallA", false),
+            pile_utxo(2, 10_000, "smallA", false),
+            pile_utxo(3, 100_000, "bigB", false),
+            pile_utxo(4, 100_000, "bigB", false),
+        ];
+        let out = select_from_pile(pile, standard_target(15_000), ltf(), change_policy())
+            .expect("selection should succeed");
+        let set: HashSet<_> = out.iter().copied().collect();
+        assert!(
+            set.contains(&op(1)) && set.contains(&op(2)),
+            "smallA picked"
+        );
+        assert!(
+            !set.contains(&op(3)) && !set.contains(&op(4)),
+            "bigB skipped"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // 3. Manual UTXO at a reused address: the manual one goes into its own
+    //    pinned group, address-mates still group as a (smaller) reused group.
+    //    This is THE subtle case that the partition-then-group order protects.
+    // ---------------------------------------------------------------------
+    #[test]
+    fn manual_at_reused_address_splits_correctly() {
+        // Address A has 3 UTXOs; one is manual.
+        // The 2 non-manual A-UTXOs form a reused group (size 2).
+        // The 1 manual A-UTXO sits alone in the manual pinned group.
+        // Target chosen so we can verify both the manual and the reused mates
+        // get selected (not just one or the other).
+        let pile = vec![
+            pile_utxo(1, 5_000, "A", true), // manual
+            pile_utxo(2, 6_000, "A", false),
+            pile_utxo(3, 7_000, "A", false),
+            pile_utxo(4, 100_000, "B", false), // unrelated single
+        ];
+        // Target 14k: manual (5k) + reused mates (6k + 7k = 13k) = 18k. Both groups
+        // are needed; B never gets touched.
+        let out = select_from_pile(pile, standard_target(14_000), ltf(), change_policy())
+            .expect("selection should succeed");
+        let set: HashSet<_> = out.iter().copied().collect();
+        assert!(set.contains(&op(1)), "manual A-UTXO must be selected");
+        assert!(
+            set.contains(&op(2)) && set.contains(&op(3)),
+            "non-manual A-mates form their own reused group and both get selected"
+        );
+        assert!(
+            !set.contains(&op(4)),
+            "B should not be selected — manual + reused-A cover the target"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // 4. Manual UTXO is always in the output, even when it's not needed for
+    //    target value alone — i.e. the manual pin is honored.
+    // ---------------------------------------------------------------------
+    #[test]
+    fn manual_utxo_is_always_in_result_even_if_unnecessary() {
+        let pile = vec![
+            pile_utxo(1, 1_000, "manual_addr", true),
+            pile_utxo(2, 1_000_000, "big_single", false),
+        ];
+        // Target 500k — the big single alone could cover it, but manual must still
+        // be included.
+        let out = select_from_pile(pile, standard_target(500_000), ltf(), change_policy())
+            .expect("selection should succeed");
+        let set: HashSet<_> = out.iter().copied().collect();
+        assert!(set.contains(&op(1)), "manual must be honored");
+        assert!(set.contains(&op(2)), "big single needed to cover target");
+    }
+
+    // ---------------------------------------------------------------------
+    // 5. Insufficient funds returns Err(missing > 0); manual selection still
+    //    leaves a missing amount even when manual is present.
+    // ---------------------------------------------------------------------
+    #[test]
+    fn insufficient_funds_returns_err() {
+        let pile = vec![
+            pile_utxo(1, 5_000, "manual_addr", true),
+            pile_utxo(2, 5_000, "X", false),
+        ];
+        let res = select_from_pile(pile, standard_target(100_000), ltf(), change_policy());
+        match res {
+            Err(missing) => assert!(missing > 0, "missing must be positive"),
+            Ok(s) => panic!("expected Err, got Ok({:?})", s),
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 6. Single addresses with no reused groups → BnB drives the whole choice;
+    //    selection must cover the target.
+    // ---------------------------------------------------------------------
+    #[test]
+    fn all_singles_bnb_drives_selection() {
+        // All addresses distinct → no reused groups, no manuals. BnB picks a
+        // subset that covers the target.
+        let pile = (1u8..=8)
+            .map(|n| pile_utxo(n, 10_000, &format!("addr_{n}"), false))
+            .collect();
+        let out = select_from_pile(pile, standard_target(45_000), ltf(), change_policy())
+            .expect("selection should succeed");
+        // Sum of selected must cover the target.
+        let total: u64 = out.len() as u64 * 10_000;
+        assert!(
+            total >= 45_000,
+            "selected value {} must cover target",
+            total
+        );
+        // BnB shouldn't pick everything when fewer suffice.
+        assert!(
+            out.len() < 8,
+            "BnB shouldn't select all 8 when a subset works"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // 7. Different address_keys for different SPKs: UTXOs with distinct
+    //    `address_key`s are NOT bundled as reused, even if values match.
+    //    Verifies the grouping key matters (catches regressions if someone
+    //    swaps `address_key` for `value` or similar).
+    // ---------------------------------------------------------------------
+    #[test]
+    fn distinct_address_keys_do_not_bundle() {
+        // 4 UTXOs, all 100k sats, all at distinct addresses → 4 single groups,
+        // no reused. Target 90k → BnB picks exactly one.
+        let pile = (1u8..=4)
+            .map(|n| pile_utxo(n, 100_000, &format!("a{n}"), false))
+            .collect();
+        let out = select_from_pile(pile, standard_target(90_000), ltf(), change_policy())
+            .expect("selection should succeed");
+        assert_eq!(out.len(), 1, "no reused grouping → BnB picks one single");
+    }
+
+    // ---------------------------------------------------------------------
+    // 8. Outpoint mapping correctness: every outpoint in the result must be
+    //    one we put in the pile (no fabricated or misindexed entries).
+    // ---------------------------------------------------------------------
+    #[test]
+    fn returned_outpoints_are_a_subset_of_input() {
+        let pile = vec![
+            pile_utxo(1, 8_000, "A", false),
+            pile_utxo(2, 9_000, "A", false),
+            pile_utxo(3, 100_000, "B", true),
+            pile_utxo(4, 50_000, "C", false),
+        ];
+        let input_ops: HashSet<_> = pile.iter().map(|u| u.outpoint).collect();
+        let out = select_from_pile(pile, standard_target(50_000), ltf(), change_policy())
+            .expect("selection should succeed");
+        for o in &out {
+            assert!(
+                input_ops.contains(o),
+                "outpoint {:?} fabricated or misindexed",
+                o
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 9. No double-selection: each outpoint appears at most once in the result.
+    // ---------------------------------------------------------------------
+    #[test]
+    fn no_outpoint_appears_twice() {
+        let pile = vec![
+            pile_utxo(1, 10_000, "A", false),
+            pile_utxo(2, 10_000, "A", false),
+            pile_utxo(3, 10_000, "B", true),
+            pile_utxo(4, 10_000, "C", false),
+            pile_utxo(5, 10_000, "C", false),
+        ];
+        let out = select_from_pile(pile, standard_target(35_000), ltf(), change_policy())
+            .expect("selection should succeed");
+        let unique: HashSet<_> = out.iter().copied().collect();
+        assert_eq!(out.len(), unique.len(), "duplicate outpoint in result");
     }
 }
