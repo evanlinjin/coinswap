@@ -1086,7 +1086,7 @@ impl Wallet {
         })
     }
 
-    /// Stores an entry into [`WalletStore`]'s prevout-to-contract map.
+    /// Stores an entry into the wallet store's prevout-to-contract map.
     /// If the prevout already existed with a contract script, this will update the existing contract.
     pub(crate) fn cache_prevout_to_contract(
         &mut self,
@@ -1116,7 +1116,7 @@ impl Wallet {
 
     /// Locks the fidelity and live_contract utxos which are not considered for spending from the wallet.
     ///
-    /// "Lock" here means adding to the wallet's local [`WalletStore::locked_outpoints`] set;
+    /// "Lock" here means adding to the wallet's local `locked_outpoints` set;
     /// the wallet's spend paths consult this set instead of Core's locked-utxo list.
     pub fn lock_unspendable_utxos(&mut self) -> Result<(), WalletError> {
         self.store.locked_outpoints.clear();
@@ -1476,7 +1476,7 @@ impl Wallet {
 
     /// Gets the next external address from the HD keychain. Saves the wallet to disk.
     ///
-    /// Driven by BDK's [`KeychainTxOutIndex`]: derives the spk at the wallet's
+    /// Driven by BDK's `KeychainTxOutIndex`: derives the spk at the wallet's
     /// `external_index`, reveals it (so future block sync indexes payments to it),
     /// and bumps the index. Both P2WPKH and P2TR share `external_index`.
     pub fn get_next_external_address(

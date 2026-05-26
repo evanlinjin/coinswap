@@ -1,7 +1,7 @@
 //! BDK-backed wallet chain state.
 //!
 //! Owns the in-memory `LocalChain` + `IndexedTxGraph` driven by `bdk_bitcoind_rpc::Emitter`,
-//! and reconstructs them from the persisted `ChangeSet`s in [`WalletStore`].
+//! and reconstructs them from the persisted `ChangeSet`s in the wallet store.
 //!
 //! The wallet tracks two flavors of script pubkeys:
 //!
@@ -194,7 +194,7 @@ impl Indexer for CoinswapIndexer {
     }
 }
 
-/// In-memory BDK state held alongside [`WalletStore`].
+/// In-memory BDK state held alongside the wallet store.
 ///
 /// Reconstructed from the persisted [`BdkChangeSet`] and from the authoritative
 /// swap/fidelity stores on load.

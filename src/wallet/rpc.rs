@@ -2,7 +2,7 @@
 //!
 //! The wallet talks to Bitcoin Core as a *node* only — it does not load a Core wallet.
 //! Block-by-block chain ingestion is driven by [`bdk_bitcoind_rpc::Emitter`], persisted
-//! into [`WalletStore`] as BDK `ChangeSet`s.
+//! into the wallet store as BDK `ChangeSet`s.
 
 use std::{convert::TryFrom, thread};
 
