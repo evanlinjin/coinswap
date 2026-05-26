@@ -15,12 +15,7 @@ use serde_json::json;
 
 use crate::utill::HEART_BEAT_INTERVAL;
 
-use super::{
-    chain::SeedKeychain,
-    error::WalletError,
-    storage::AddressType,
-    Wallet,
-};
+use super::{chain::SeedKeychain, error::WalletError, storage::AddressType, Wallet};
 
 /// Configuration parameters for connecting to a Bitcoin node via RPC.
 #[derive(Debug, Clone)]
@@ -90,8 +85,11 @@ impl Wallet {
         let last_cp = self.bdk.chain.tip();
         let mut emitter = Emitter::new(&self.rpc, last_cp, start_height, NO_EXPECTED_MEMPOOL_TXS);
 
-        let mut tip_height: u32 = self.store.last_synced_height.unwrap_or(0).min(u32::MAX as u64)
-            as u32;
+        let mut tip_height: u32 = self
+            .store
+            .last_synced_height
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32;
 
         let mut blocks_since_persist: u32 = 0;
 
@@ -103,13 +101,11 @@ impl Wallet {
             };
             let height = event.block_height();
 
-            let chain_cs = self
-                .bdk
-                .chain
-                .apply_update(event.checkpoint)
-                .map_err(|e: CannotConnectError| {
+            let chain_cs = self.bdk.chain.apply_update(event.checkpoint).map_err(
+                |e: CannotConnectError| {
                     WalletError::General(format!("LocalChain::apply_update: {e}"))
-                })?;
+                },
+            )?;
             let graph_cs = self.bdk.graph.apply_block_relevant(&event.block, height);
 
             self.store.bdk.local_chain.merge(chain_cs);
@@ -126,11 +122,12 @@ impl Wallet {
         }
 
         // Mempool ingest.
-        let mempool = emitter
-            .mempool()
-            .map_err(WalletError::Rpc)?;
+        let mempool = emitter.mempool().map_err(WalletError::Rpc)?;
         if !mempool.update.is_empty() {
-            let mempool_cs = self.bdk.graph.batch_insert_relevant_unconfirmed(mempool.update);
+            let mempool_cs = self
+                .bdk
+                .graph
+                .batch_insert_relevant_unconfirmed(mempool.update);
             self.store.bdk.indexed_tx_graph.merge(mempool_cs);
         }
 

@@ -1151,7 +1151,9 @@ impl Wallet {
 
     /// Lock a set of outpoints locally so the spend paths skip them.
     pub fn lock_outpoints(&mut self, outpoints: &[OutPoint]) {
-        self.store.locked_outpoints.extend(outpoints.iter().copied());
+        self.store
+            .locked_outpoints
+            .extend(outpoints.iter().copied());
     }
 
     /// Return all locally-locked outpoints.
@@ -1516,13 +1518,10 @@ impl Wallet {
         };
         // Internal addresses are stateless from the caller's perspective — find the
         // next unused index from BDK's view.
-        let (start, _) = self
-            .bdk
-            .graph
-            .index
-            .seed
-            .next_index(kc)
-            .ok_or_else(|| WalletError::General("internal keychain not registered".to_string()))?;
+        let (start, _) =
+            self.bdk.graph.index.seed.next_index(kc).ok_or_else(|| {
+                WalletError::General("internal keychain not registered".to_string())
+            })?;
 
         let mut addresses = Vec::with_capacity(count as usize);
         for i in 0..count {
@@ -1604,25 +1603,27 @@ impl Wallet {
             // Not an HD spk — check watch keys for swap multisigs (where we can attach
             // the witness_script). Other watch keys (contracts, fidelity, sweep) don't
             // need a witness_script in the legacy entry.
-            let idx = self.bdk.graph.index.watch.index_of_spk(
-                full_txo.txout.script_pubkey.as_script(),
-            );
+            let idx = self
+                .bdk
+                .graph
+                .index
+                .watch
+                .index_of_spk(full_txo.txout.script_pubkey.as_script());
             if let Some(super::chain::WatchKey::Swap(multisig)) = idx {
                 // The WatchKey carries the multisig redeem script directly.
                 witness_script = Some(multisig.clone());
             }
         }
 
-        let address = Address::from_script(
-            &full_txo.txout.script_pubkey,
-            self.store.network,
-        )
-        .ok()
-        .map(|addr| {
-            // ListUnspentResultEntry uses NetworkUnchecked addresses
-            let s = addr.to_string();
-            bitcoin::Address::from_str(&s).expect("roundtrip").into_unchecked()
-        });
+        let address = Address::from_script(&full_txo.txout.script_pubkey, self.store.network)
+            .ok()
+            .map(|addr| {
+                // ListUnspentResultEntry uses NetworkUnchecked addresses
+                let s = addr.to_string();
+                bitcoin::Address::from_str(&s)
+                    .expect("roundtrip")
+                    .into_unchecked()
+            });
 
         let spendable = !self.store.locked_outpoints.contains(&op);
 
@@ -1685,7 +1686,10 @@ impl Wallet {
         for (_, full_txo) in view.filter_unspent_outpoints(watch_outpoints) {
             // Skip duplicates — an outpoint may be reachable through both an HD spk and a
             // watch spk (e.g. swept-incoming coins).
-            if entries.iter().any(|e| e.txid == full_txo.outpoint.txid && e.vout == full_txo.outpoint.vout) {
+            if entries
+                .iter()
+                .any(|e| e.txid == full_txo.outpoint.txid && e.vout == full_txo.outpoint.vout)
+            {
                 continue;
             }
             entries.push(self.synth_utxo_entry(full_txo.outpoint, &full_txo, tip_height));

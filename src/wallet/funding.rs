@@ -8,7 +8,6 @@ use bitcoin::{
     Address, Amount, OutPoint, Transaction,
 };
 
-
 use crate::{utill::calculate_fee_sats, wallet::Destination};
 
 use super::Wallet;

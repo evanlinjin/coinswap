@@ -33,11 +33,7 @@ use bitcoin::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::wallet::{
-    api::KeychainKind,
-    error::WalletError,
-    storage::AddressType,
-};
+use crate::wallet::{api::KeychainKind, error::WalletError, storage::AddressType};
 
 /// Number of lookahead spks per HD keychain. Higher = more memory but safer against
 /// missed-payment situations when the wallet receives bursts of payments past the
@@ -238,8 +234,7 @@ impl BdkChain {
             indexer.watch.insert_spk(k, spk);
         }
 
-        let mut graph =
-            IndexedTxGraph::<ConfirmationBlockTime, CoinswapIndexer>::new(indexer);
+        let mut graph = IndexedTxGraph::<ConfirmationBlockTime, CoinswapIndexer>::new(indexer);
         graph.apply_changeset(persisted.indexed_tx_graph.clone());
 
         Ok(Self { chain, graph })
