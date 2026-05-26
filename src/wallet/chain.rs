@@ -29,7 +29,7 @@ use bdk_chain::{
 use bitcoin::{
     bip32::{DerivationPath, Xpriv, Xpub},
     secp256k1::Secp256k1,
-    Network, OutPoint, ScriptBuf, Transaction, TxOut, Txid,
+    Network, OutPoint, ScriptBuf, Transaction, TxOut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -112,12 +112,16 @@ impl SeedKeychain {
 }
 
 /// Identifies a fixed (non-derivable) script tracked alongside the HD keychains.
+///
+/// Keys are chosen for stable identity across the swapcoin lifecycle: a swap's
+/// multisig script exists before its contract tx is broadcast, so we key on the
+/// script itself rather than the contract txid.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum WatchKey {
-    /// 2-of-2 multisig redeem script (P2WSH) for a swapcoin, keyed by the swap contract txid.
-    Swap(Txid),
-    /// Contract redeem script (HTLC) for a swapcoin, keyed by the contract txid.
-    Contract(Txid),
+    /// 2-of-2 multisig redeem script (P2WSH) for a swapcoin, keyed by the redeem script.
+    Swap(ScriptBuf),
+    /// Contract redeem script (HTLC) for a swapcoin, keyed by the redeem script.
+    Contract(ScriptBuf),
     /// Fidelity bond timelock script, keyed by its index in `WalletStore::fidelity_bond`.
     Fidelity(u32),
     /// A previously-revealed seed scriptpubkey that has been "swept" (recovered) into the

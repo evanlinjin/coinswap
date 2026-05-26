@@ -285,33 +285,31 @@ impl Wallet {
 
         let mut watch = Vec::new();
         for sc in store.incoming_swapcoins.values() {
-            let txid = sc.contract_tx.compute_txid();
             if let Some(ref multisig) = sc.multisig_redeemscript {
                 watch.push((
-                    WatchKey::Swap(txid),
+                    WatchKey::Swap(multisig.clone()),
                     ScriptBuf::new_p2wsh(&multisig.wscript_hash()),
                 ));
             }
             if let Some(ref redeem) = sc.contract_redeemscript {
                 watch.push((
-                    WatchKey::Contract(txid),
+                    WatchKey::Contract(redeem.clone()),
                     ScriptBuf::new_p2wsh(&redeem.wscript_hash()),
                 ));
             }
         }
         for sc in store.outgoing_swapcoins.values() {
-            let txid = sc.contract_tx.compute_txid();
             if let (Some(my_pk), Some(other_pk)) = (sc.my_pubkey, sc.other_pubkey) {
                 let multisig =
                     crate::protocol::contract::create_multisig_redeemscript(&my_pk, &other_pk);
                 watch.push((
-                    WatchKey::Swap(txid),
+                    WatchKey::Swap(multisig.clone()),
                     ScriptBuf::new_p2wsh(&multisig.wscript_hash()),
                 ));
             }
             if let Some(ref redeem) = sc.contract_redeemscript {
                 watch.push((
-                    WatchKey::Contract(txid),
+                    WatchKey::Contract(redeem.clone()),
                     ScriptBuf::new_p2wsh(&redeem.wscript_hash()),
                 ));
             }
@@ -1188,29 +1186,58 @@ impl Wallet {
     }
 
     /// Locks the fidelity and live_contract utxos which are not considered for spending from the wallet.
-    pub fn lock_unspendable_utxos(&self) -> Result<(), WalletError> {
-        self.rpc.unlock_unspent_all()?;
+    ///
+    /// "Lock" here means adding to the wallet's local [`WalletStore::locked_outpoints`] set;
+    /// the wallet's spend paths consult this set instead of Core's locked-utxo list.
+    pub fn lock_unspendable_utxos(&mut self) -> Result<(), WalletError> {
+        self.store.locked_outpoints.clear();
 
-        let all_unspents = self
-            .rpc
-            .list_unspent(Some(0), Some(9999999), None, None, None)?;
-        let utxos_to_lock = &all_unspents
-            .into_iter()
-            .filter(|u| {
-                self.check_and_derive_descriptor_utxo_or_swap_coin(u)
-                    .unwrap()
+        // Walk the cached UTXOs and lock any that aren't a regular seed coin or swap coin —
+        // i.e. fidelity bonds, live contracts, etc.
+        let to_lock: Vec<OutPoint> = self
+            .store
+            .utxo_cache
+            .iter()
+            .filter_map(|(op, (utxo, _spend_info))| {
+                if self
+                    .check_and_derive_descriptor_utxo_or_swap_coin(utxo)
+                    .ok()
+                    .flatten()
                     .is_none()
+                {
+                    Some(*op)
+                } else {
+                    None
+                }
             })
-            .map(|u| OutPoint {
-                txid: u.txid,
-                vout: u.vout,
-            })
-            .collect::<Vec<OutPoint>>();
-        self.rpc.lock_unspent(utxos_to_lock)?;
+            .collect();
+        self.store.locked_outpoints.extend(to_lock);
         Ok(())
     }
 
+    /// Unlock all locally-locked outpoints.
+    pub fn unlock_all_outpoints(&mut self) {
+        self.store.locked_outpoints.clear();
+    }
+
+    /// Lock a set of outpoints locally so the spend paths skip them.
+    pub fn lock_outpoints(&mut self, outpoints: &[OutPoint]) {
+        self.store.locked_outpoints.extend(outpoints.iter().copied());
+    }
+
+    /// Return all locally-locked outpoints.
+    pub fn list_locked_outpoints(&self) -> Vec<OutPoint> {
+        self.store.locked_outpoints.iter().copied().collect()
+    }
+
+    #[allow(dead_code)]
     fn list_lock_unspent(&self) -> Result<Vec<OutPoint>, WalletError> {
+        // Legacy shim, kept for compatibility with callers that still expect it.
+        Ok(self.list_locked_outpoints())
+    }
+
+    #[allow(dead_code)]
+    fn _list_lock_unspent_legacy(&self) -> Result<Vec<OutPoint>, WalletError> {
         // Call the RPC method "listlockunspent" with no parameters.
         let locked_utxos: Vec<LockedUtxo> = self.rpc.call("listlockunspent", &[])?;
 
@@ -1563,45 +1590,70 @@ impl Wallet {
         Ok((max_index + 1) as u32)
     }
 
-    /// Gets the next external address from the HD keychain. Saves the wallet to disk
+    /// Gets the next external address from the HD keychain. Saves the wallet to disk.
+    ///
+    /// Driven by BDK's [`KeychainTxOutIndex`]: derives the spk at the wallet's
+    /// `external_index`, reveals it (so future block sync indexes payments to it),
+    /// and bumps the index. Both P2WPKH and P2TR share `external_index`.
     pub fn get_next_external_address(
         &mut self,
         address_type: AddressType,
     ) -> Result<Address, WalletError> {
-        let descriptors = self.get_wallet_descriptors(address_type)?;
-        let receive_branch_descriptor = descriptors
-            .get(&KeychainKind::External)
-            .expect("external keychain expected");
-        let receive_address = self.rpc.derive_addresses(
-            receive_branch_descriptor,
-            Some([self.store.external_index, self.store.external_index]),
-        )?[0]
-            .clone();
+        let kc = SeedKeychain {
+            address_type,
+            kind: KeychainKind::External,
+        };
+        let idx = self.store.external_index;
+        // Reveal up to this index so the spk is known to BDK; ignore the (deltas) ChangeSet
+        // because the next sync will roll it into store.bdk via the regular merge path.
+        let _ = self.bdk.reveal_to(kc, idx);
+        let spk = self.bdk.spk_at(kc, idx).ok_or_else(|| {
+            WalletError::General(format!(
+                "BDK could not derive spk for {:?} at index {idx}",
+                kc
+            ))
+        })?;
+        let address = Address::from_script(&spk, self.store.network)
+            .map_err(|e| WalletError::General(format!("address from spk: {e}")))?;
         self.store.external_index += 1;
         self.save_to_disk()?;
-        Ok(receive_address.assume_checked())
+        Ok(address)
     }
 
-    /// Gets the next internal addresses from the HD keychain.
+    /// Gets the next `count` internal addresses from the HD keychain.
     pub fn get_next_internal_addresses(
         &self,
         count: u32,
         address_type: AddressType,
     ) -> Result<Vec<Address>, WalletError> {
-        let next_change_addr_index = self.find_hd_next_index(KeychainKind::Internal)?;
-        let descriptors = self.get_wallet_descriptors(address_type)?;
-        let change_branch_descriptor = descriptors
-            .get(&KeychainKind::Internal)
-            .expect("Internal Keychain expected");
-        let addresses = self.rpc.derive_addresses(
-            change_branch_descriptor,
-            Some([next_change_addr_index, next_change_addr_index + count]),
-        )?;
+        let kc = SeedKeychain {
+            address_type,
+            kind: KeychainKind::Internal,
+        };
+        // Internal addresses are stateless from the caller's perspective — find the
+        // next unused index from BDK's view.
+        let (start, _) = self
+            .bdk
+            .graph
+            .index
+            .seed
+            .next_index(kc)
+            .ok_or_else(|| WalletError::General("internal keychain not registered".to_string()))?;
 
-        Ok(addresses
-            .into_iter()
-            .map(|addrs| addrs.assume_checked())
-            .collect())
+        let mut addresses = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let idx = start + i;
+            let spk = self.bdk.spk_at(kc, idx).ok_or_else(|| {
+                WalletError::General(format!(
+                    "BDK could not derive internal spk for {:?} at index {idx}",
+                    kc
+                ))
+            })?;
+            let addr = Address::from_script(&spk, self.store.network)
+                .map_err(|e| WalletError::General(format!("address from spk: {e}")))?;
+            addresses.push(addr);
+        }
+        Ok(addresses)
     }
 
     /// Refreshes the offer maximum size cache based on the current wallet's unspent transaction outputs (UTXOs).
@@ -1661,23 +1713,9 @@ impl Wallet {
             let idx = self.bdk.graph.index.watch.index_of_spk(
                 full_txo.txout.script_pubkey.as_script(),
             );
-            if let Some(super::chain::WatchKey::Swap(txid)) = idx {
-                // Find the corresponding multisig redeemscript in the swapcoin store.
-                if let Some(sc) = self.store.incoming_swapcoins.values().find(|s| {
-                    s.contract_tx.compute_txid() == *txid
-                }) {
-                    witness_script = sc.multisig_redeemscript.clone();
-                } else if let Some(sc) = self.store.outgoing_swapcoins.values().find(|s| {
-                    s.contract_tx.compute_txid() == *txid
-                }) {
-                    if let (Some(my_pk), Some(other_pk)) = (sc.my_pubkey, sc.other_pubkey) {
-                        witness_script = Some(
-                            crate::protocol::contract::create_multisig_redeemscript(
-                                &my_pk, &other_pk,
-                            ),
-                        );
-                    }
-                }
+            if let Some(super::chain::WatchKey::Swap(multisig)) = idx {
+                // The WatchKey carries the multisig redeem script directly.
+                witness_script = Some(multisig.clone());
             }
         }
 
@@ -2344,15 +2382,10 @@ impl Wallet {
         let address = Address::from_script(&multisig_spk, self.store.network)
             .map_err(|e| WalletError::General(format!("multisig address: {e}")))?;
 
-        // We don't know the eventual contract txid yet, so register this watch key
-        // using a hash of the multisig script. When the swapcoin is later added,
-        // `build_bdk_chain`'s rebuilds and any subsequent `sync()` insertion will
-        // re-key it under `WatchKey::Swap(contract_txid)` (idempotent w.r.t. UTXOs).
-        use bitcoin::hashes::Hash as _;
-        // Use a double-SHA256 of the multisig script (matches the bitcoin txid hash type).
-        let hash_bytes = bitcoin::hashes::sha256d::Hash::hash(multisig.as_bytes());
-        let pseudo_txid = bitcoin::Txid::from_raw_hash(hash_bytes);
-        self.bdk.watch(super::chain::WatchKey::Swap(pseudo_txid), multisig_spk);
+        // Register the multisig spk with BDK. WatchKey::Swap is keyed on the redeem
+        // script itself, so the identity is stable from creation through swapcoin commit.
+        self.bdk
+            .watch(super::chain::WatchKey::Swap(multisig.clone()), multisig_spk);
 
         Ok((address, my_privkey))
     }

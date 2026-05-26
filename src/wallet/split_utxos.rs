@@ -189,7 +189,7 @@ impl Wallet {
     /// This either creates dynamic splits with bounded, similar, randomized amounts OR gives a simple 1-1 output.
     /// It never creates a signature i.e a tiny change/target utxo, as that would be a privacy leak.
     pub fn create_dynamic_splits(
-        &self,
+        &mut self,
         inital_selected_inputs: Vec<(ListUnspentResultEntry, UTXOSpendInfo)>,
         target: u64,
         fee_rate: f64,
@@ -318,7 +318,7 @@ impl Wallet {
                 .map(|(unspent, _)| bitcoin::OutPoint::new(unspent.txid, unspent.vout))
                 .collect::<Vec<_>>();
 
-            self.rpc.lock_unspent(&outpoints).unwrap();
+            self.lock_outpoints(&outpoints);
 
             // let delta_input_sum: u64 = delta_inputs.iter().sum();
             let delta_input_sum = delta_inputs.iter().fold(Amount::ZERO, |acc, (unspent, _)| {

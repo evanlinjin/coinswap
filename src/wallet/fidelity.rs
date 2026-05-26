@@ -442,6 +442,13 @@ impl Wallet {
     ) -> Result<(u32, Txid), WalletError> {
         let (index, fidelity_addr, fidelity_pubkey) = self.get_next_fidelity_address(locktime)?;
 
+        // Register this bond's spk with BDK before the funding tx hits a block so the
+        // payment is recognized during the next sync.
+        self.bdk.watch(
+            super::chain::WatchKey::Fidelity(index),
+            fidelity_addr.script_pubkey(),
+        );
+
         let coins = self.coin_select(amount, feerate, None, None)?;
         let outputs = vec![(fidelity_addr, amount)];
 
