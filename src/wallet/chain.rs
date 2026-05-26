@@ -245,11 +245,6 @@ impl BdkChain {
         Ok(Self { chain, graph })
     }
 
-    /// Return the tip block id of the local chain.
-    pub(crate) fn tip(&self) -> bdk_chain::BlockId {
-        self.chain.tip().block_id()
-    }
-
     /// Reveal HD scripts up to (and including) `target` for the given keychain.
     pub(crate) fn reveal_to(
         &mut self,
@@ -262,18 +257,6 @@ impl BdkChain {
             .reveal_to_target(keychain, target)
             .map(|(_, cs)| cs)
             .unwrap_or_default()
-    }
-
-    /// Reveal the next unused HD script for the given keychain. Returns `(index, script)`.
-    pub(crate) fn reveal_next(
-        &mut self,
-        keychain: SeedKeychain,
-    ) -> Option<(u32, ScriptBuf, bdk_chain::keychain_txout::ChangeSet)> {
-        self.graph
-            .index
-            .seed
-            .reveal_next_spk(keychain)
-            .map(|((idx, spk), cs)| (idx, spk, cs))
     }
 
     /// Script for the given (keychain, index) pair, deriving lazily within the lookahead window.

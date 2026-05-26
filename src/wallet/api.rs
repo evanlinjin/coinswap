@@ -25,10 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::{
-    utill::{
-        compute_checksum, generate_keypair, get_hd_path_from_descriptor,
-        redeemscript_to_scriptpubkey,
-    },
+    utill::{generate_keypair, get_hd_path_from_descriptor},
     wallet::split_utxos::MAX_SPLITS,
 };
 
@@ -120,12 +117,6 @@ impl PartialEq for Wallet {
 pub(crate) enum KeychainKind {
     External = 0isize,
     Internal,
-}
-
-#[derive(Deserialize)]
-struct LockedUtxo {
-    txid: Txid,
-    vout: u32,
 }
 
 impl KeychainKind {
@@ -478,6 +469,20 @@ impl Wallet {
         self.store
             .incoming_swapcoins
             .insert(key.clone(), coin.clone());
+        // Register the swap's multisig and contract spks with BDK so future blocks
+        // index payments to them.
+        if let Some(ref multisig) = coin.multisig_redeemscript {
+            self.bdk.watch(
+                super::chain::WatchKey::Swap(multisig.clone()),
+                ScriptBuf::new_p2wsh(&multisig.wscript_hash()),
+            );
+        }
+        if let Some(ref redeem) = coin.contract_redeemscript {
+            self.bdk.watch(
+                super::chain::WatchKey::Contract(redeem.clone()),
+                ScriptBuf::new_p2wsh(&redeem.wscript_hash()),
+            );
+        }
         log::info!(
             "Added incoming swapcoin to wallet store: {} (total: {})",
             key,
@@ -493,6 +498,20 @@ impl Wallet {
         self.store
             .outgoing_swapcoins
             .insert(key.clone(), coin.clone());
+        if let (Some(my_pk), Some(other_pk)) = (coin.my_pubkey, coin.other_pubkey) {
+            let multisig =
+                crate::protocol::contract::create_multisig_redeemscript(&my_pk, &other_pk);
+            self.bdk.watch(
+                super::chain::WatchKey::Swap(multisig.clone()),
+                ScriptBuf::new_p2wsh(&multisig.wscript_hash()),
+            );
+        }
+        if let Some(ref redeem) = coin.contract_redeemscript {
+            self.bdk.watch(
+                super::chain::WatchKey::Contract(redeem.clone()),
+                ScriptBuf::new_p2wsh(&redeem.wscript_hash()),
+            );
+        }
         log::info!(
             "Added outgoing swapcoin to wallet store: {} (total: {})",
             key,
@@ -1067,15 +1086,6 @@ impl Wallet {
         })
     }
 
-    /// Dynamic address import count function. 10 for tests, 5000 for production.
-    pub(crate) fn get_addrss_import_count(&self) -> u32 {
-        if cfg!(feature = "integration-test") {
-            10
-        } else {
-            5000
-        }
-    }
-
     /// Stores an entry into [`WalletStore`]'s prevout-to-contract map.
     /// If the prevout already existed with a contract script, this will update the existing contract.
     pub(crate) fn cache_prevout_to_contract(
@@ -1099,90 +1109,9 @@ impl Wallet {
         }
     }
 
-    /// Wallet descriptors are derivable. Currently only supports two KeychainKind. Internal and External.
-    fn get_wallet_descriptors(
-        &self,
-        address_type: AddressType,
-    ) -> Result<HashMap<KeychainKind, String>, WalletError> {
-        let secp = Secp256k1::new();
-        let derivation_path = Self::get_derivation_path(address_type);
-        let wallet_xpub = Xpub::from_priv(
-            &secp,
-            &self
-                .store
-                .master_key
-                .derive_priv(&secp, &DerivationPath::from_str(derivation_path)?)?,
-        );
-
-        // Get descriptors for external and internal keychain. Other chains are not supported yet.
-        [KeychainKind::External, KeychainKind::Internal]
-            .iter()
-            .map(|keychain| {
-                let descriptor_without_checksum = match address_type {
-                    AddressType::P2WPKH => {
-                        format!("wpkh({}/{}/*)", wallet_xpub, keychain.index_num())
-                    }
-                    AddressType::P2TR => {
-                        format!("tr({}/{}/*)", wallet_xpub, keychain.index_num())
-                    }
-                };
-                let decriptor = format!(
-                    "{}#{}",
-                    descriptor_without_checksum,
-                    compute_checksum(&descriptor_without_checksum)?
-                );
-                Ok((*keychain, decriptor))
-            })
-            .collect()
-    }
-
-    /// Checks if the addresses derived from the wallet descriptor is imported upto full index range.
-    /// Returns the list of descriptors not imported yet. Max index range is as below:
-    /// Production => 5000
-    /// Integration Tests => 6
-    pub(super) fn get_unimported_wallet_desc(
-        &self,
-        address_type: AddressType,
-    ) -> Result<Vec<String>, WalletError> {
-        let mut unimported = Vec::new();
-        for (_, descriptor) in self.get_wallet_descriptors(address_type)? {
-            let first_addr = self.rpc.derive_addresses(&descriptor, Some([0, 0]))?[0].clone();
-
-            let last_index = self.get_addrss_import_count() - 1;
-            let last_addr = self
-                .rpc
-                .derive_addresses(&descriptor, Some([last_index, last_index]))?[0]
-                .clone();
-
-            let first_addr_imported = self
-                .rpc
-                .get_address_info(&first_addr.assume_checked())?
-                .is_watchonly
-                .unwrap_or(false);
-            let last_addr_imported = self
-                .rpc
-                .get_address_info(&last_addr.assume_checked())?
-                .is_watchonly
-                .unwrap_or(false);
-
-            if !first_addr_imported || !last_addr_imported {
-                unimported.push(descriptor);
-            }
-        }
-
-        Ok(unimported)
-    }
-
     /// Gets the external index from the wallet.
     pub fn get_external_index(&self) -> &u32 {
         &self.store.external_index
-    }
-
-    /// Core wallet label is the master Xpub(crate) fingerint.
-    pub(crate) fn get_core_wallet_label(&self) -> String {
-        let secp = Secp256k1::new();
-        let m_xpub = Xpub::from_priv(&secp, &self.store.master_key);
-        m_xpub.fingerprint().to_string()
     }
 
     /// Locks the fidelity and live_contract utxos which are not considered for spending from the wallet.
@@ -1230,25 +1159,8 @@ impl Wallet {
         self.store.locked_outpoints.iter().copied().collect()
     }
 
-    #[allow(dead_code)]
     fn list_lock_unspent(&self) -> Result<Vec<OutPoint>, WalletError> {
-        // Legacy shim, kept for compatibility with callers that still expect it.
         Ok(self.list_locked_outpoints())
-    }
-
-    #[allow(dead_code)]
-    fn _list_lock_unspent_legacy(&self) -> Result<Vec<OutPoint>, WalletError> {
-        // Call the RPC method "listlockunspent" with no parameters.
-        let locked_utxos: Vec<LockedUtxo> = self.rpc.call("listlockunspent", &[])?;
-
-        // Convert each LockedUtxo into an OutPoint.
-        Ok(locked_utxos
-            .into_iter()
-            .map(|lu| OutPoint {
-                txid: lu.txid,
-                vout: lu.vout,
-            })
-            .collect())
     }
 
     /// Checks if a UTXO belongs to fidelity bonds, and then returns corresponding UTXOSpendInfo
@@ -1560,34 +1472,6 @@ impl Wallet {
             );
         }
         (unfinished_incomings, unfinished_outgoings)
-    }
-
-    /// Finds the next unused index in the HD keychain.
-    ///
-    /// It will only return an unused address; i.e., an address that doesn't have a transaction associated with it.
-    pub(super) fn find_hd_next_index(&self, keychain: KeychainKind) -> Result<u32, WalletError> {
-        let mut max_index: i32 = -1;
-
-        let mut utxos = self.list_descriptor_utxo_spend_info();
-        let mut swap_coin_utxo = self.list_swap_coin_utxo_spend_info();
-        utxos.append(&mut swap_coin_utxo);
-
-        for (utxo, _) in utxos {
-            if utxo.descriptor.is_none() {
-                continue;
-            }
-            let descriptor = utxo.descriptor.expect("its not none");
-            let ret = get_hd_path_from_descriptor(&descriptor);
-            if ret.is_none() {
-                continue;
-            }
-            let (_, addr_type, index) = ret.expect("its not none");
-            if addr_type != keychain.index_num() {
-                continue;
-            }
-            max_index = std::cmp::max(max_index, index);
-        }
-        Ok((max_index + 1) as u32)
     }
 
     /// Gets the next external address from the HD keychain. Saves the wallet to disk.
@@ -2388,73 +2272,6 @@ impl Wallet {
             .watch(super::chain::WatchKey::Swap(multisig.clone()), multisig_spk);
 
         Ok((address, my_privkey))
-    }
-
-    pub(crate) fn descriptors_to_import(&self) -> Result<Vec<String>, WalletError> {
-        let mut descriptors_to_import = Vec::new();
-
-        // Import both P2WPKH and P2TR descriptors to support both address types
-        descriptors_to_import.extend(self.get_unimported_wallet_desc(AddressType::P2WPKH)?);
-        descriptors_to_import.extend(self.get_unimported_wallet_desc(AddressType::P2TR)?);
-
-        // Import swapcoin descriptors (Legacy only — multisig + contract redeemscripts)
-        for sc in self.store.incoming_swapcoins.values() {
-            if let (Some(my_pubkey), Some(other_pubkey)) = (sc.my_pubkey, sc.other_pubkey) {
-                let descriptor_without_checksum =
-                    format!("wsh(sortedmulti(2,{},{}))", other_pubkey, my_pubkey);
-                descriptors_to_import.push(format!(
-                    "{}#{}",
-                    descriptor_without_checksum,
-                    compute_checksum(&descriptor_without_checksum)?
-                ));
-            }
-            if let Some(ref redeemscript) = sc.contract_redeemscript {
-                let contract_spk = redeemscript_to_scriptpubkey(redeemscript)?;
-                let descriptor_without_checksum = format!("raw({contract_spk:x})");
-                descriptors_to_import.push(format!(
-                    "{}#{}",
-                    descriptor_without_checksum,
-                    compute_checksum(&descriptor_without_checksum)?
-                ));
-            }
-        }
-
-        for sc in self.store.outgoing_swapcoins.values() {
-            if let (Some(my_pubkey), Some(other_pubkey)) = (sc.my_pubkey, sc.other_pubkey) {
-                let descriptor_without_checksum =
-                    format!("wsh(sortedmulti(2,{},{}))", other_pubkey, my_pubkey);
-                descriptors_to_import.push(format!(
-                    "{}#{}",
-                    descriptor_without_checksum,
-                    compute_checksum(&descriptor_without_checksum)?
-                ));
-            }
-            if let Some(ref redeemscript) = sc.contract_redeemscript {
-                let contract_spk = redeemscript_to_scriptpubkey(redeemscript)?;
-                let descriptor_without_checksum = format!("raw({contract_spk:x})");
-                descriptors_to_import.push(format!(
-                    "{}#{}",
-                    descriptor_without_checksum,
-                    compute_checksum(&descriptor_without_checksum)?
-                ));
-            }
-        }
-
-        descriptors_to_import.extend(
-            self.store
-                .fidelity_bond
-                .values()
-                .map(|bond| {
-                    let descriptor_without_checksum = format!("raw({:x})", bond.script_pub_key());
-                    Ok(format!(
-                        "{}#{}",
-                        descriptor_without_checksum,
-                        compute_checksum(&descriptor_without_checksum)?
-                    ))
-                })
-                .collect::<Result<Vec<String>, WalletError>>()?,
-        );
-        Ok(descriptors_to_import)
     }
 
     /// Uses internal RPC client to broadcast a transaction
