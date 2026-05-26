@@ -13,7 +13,7 @@ use crate::security::KeyMaterial;
 
 use bip39::Mnemonic;
 use bitcoin::{
-    bip32::{ChildNumber, DerivationPath, Xpriv, Xpub},
+    bip32::{ChildNumber, DerivationPath, Xpriv},
     key::TapTweak,
     secp256k1,
     secp256k1::{Keypair, Secp256k1, SecretKey},
@@ -1547,17 +1547,27 @@ impl Wallet {
         Ok(())
     }
 
-    /// Master xpub fingerprint, used in synthesized descriptors for the legacy UTXO shim.
-    fn master_fingerprint(&self) -> bitcoin::bip32::Fingerprint {
+    /// Account-level xpriv fingerprint (the one used inside synthesized descriptors).
+    ///
+    /// `check_and_derive_descriptor_utxo_or_swap_coin` compares the descriptor's
+    /// origin fingerprint against `master_key.derive_priv(account_path).fingerprint()`,
+    /// so we must put the *account*-level fingerprint here — not the master xpub's.
+    fn account_fingerprint(&self, address_type: AddressType) -> bitcoin::bip32::Fingerprint {
         let secp = Secp256k1::new();
-        Xpub::from_priv(&secp, &self.store.master_key).fingerprint()
+        let path = Self::get_derivation_path(address_type);
+        let account_xpriv = self
+            .store
+            .master_key
+            .derive_priv(&secp, &DerivationPath::from_str(path).expect("static path"))
+            .expect("derive account xpriv");
+        account_xpriv.fingerprint(&secp)
     }
 
     /// Synthesize a Core-style descriptor string for an HD-derived UTXO so that
     /// [`get_hd_path_from_descriptor`] continues to parse it. The output looks like
     /// `wpkh([fingerprint/branch/index]...)` or `tr([fingerprint/branch/index]...)`.
     fn synth_descriptor_for(&self, address_type: AddressType, branch: u32, index: u32) -> String {
-        let fp = self.master_fingerprint();
+        let fp = self.account_fingerprint(address_type);
         match address_type {
             AddressType::P2WPKH => format!("wpkh([{fp}/{branch}/{index}])"),
             AddressType::P2TR => format!("tr([{fp}/{branch}/{index}])"),
