@@ -214,14 +214,16 @@ impl BdkChain {
         seed_descriptors: impl IntoIterator<Item = (SeedKeychain, Descriptor<DescriptorPublicKey>)>,
         watch_spks: impl IntoIterator<Item = (WatchKey, ScriptBuf)>,
     ) -> Result<Self, WalletError> {
-        let chain = if persisted.local_chain.blocks.is_empty() {
-            let genesis_hash = bitcoin::constants::genesis_block(network).block_hash();
-            let (chain, _genesis_cs) = LocalChain::from_genesis(genesis_hash);
+        // Always seed the chain with genesis. The persisted ChangeSet only contains
+        // deltas added by `apply_update` (which never re-emits genesis), so feeding it
+        // straight into `from_changeset` would error with "genesis block is missing".
+        let genesis_hash = bitcoin::constants::genesis_block(network).block_hash();
+        let (mut chain, _) = LocalChain::from_genesis(genesis_hash);
+        if !persisted.local_chain.blocks.is_empty() {
             chain
-        } else {
-            LocalChain::from_changeset(persisted.local_chain.clone())
-                .map_err(|e| WalletError::General(format!("load LocalChain: {e}")))?
-        };
+                .apply_changeset(&persisted.local_chain)
+                .map_err(|e| WalletError::General(format!("apply LocalChain changeset: {e}")))?;
+        }
 
         let mut indexer = CoinswapIndexer::new();
         for (kc, desc) in seed_descriptors {

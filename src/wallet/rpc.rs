@@ -15,7 +15,7 @@ use serde_json::json;
 
 use crate::utill::HEART_BEAT_INTERVAL;
 
-use super::{chain::SeedKeychain, error::WalletError, storage::AddressType, Wallet};
+use super::{chain::SeedKeychain, error::WalletError, Wallet};
 
 /// Configuration parameters for connecting to a Bitcoin node via RPC.
 #[derive(Debug, Clone)]
@@ -136,13 +136,19 @@ impl Wallet {
         // Refresh the legacy `utxo_cache` shim so existing call sites see up-to-date UTXOs.
         self.refresh_utxo_cache_from_bdk()?;
 
-        // Sync the legacy `external_index` field with BDK's view (next-to-reveal).
-        if let Some((next_idx, _)) = self.bdk.graph.index.seed.next_index(SeedKeychain {
-            address_type: AddressType::P2WPKH,
-            kind: super::api::KeychainKind::External,
-        }) {
-            self.store.external_index = self.store.external_index.max(next_idx);
-        }
+        // Ensure `external_index` doesn't lag behind addresses that actually saw payments
+        // (e.g. on a wallet restored from an older backup). We bump it past the highest
+        // *used* external index across both HD address types — never past spk indices we
+        // only revealed via the lookahead window, which would over-eagerly advance the
+        // counter on every sync.
+        let max_used = SeedKeychain::all()
+            .iter()
+            .filter(|kc| kc.kind == super::api::KeychainKind::External)
+            .filter_map(|kc| self.bdk.graph.index.seed.last_used_index(*kc))
+            .map(|i| i + 1)
+            .max()
+            .unwrap_or(0);
+        self.store.external_index = self.store.external_index.max(max_used);
 
         self.refresh_offer_maxsize_cache()?;
 
