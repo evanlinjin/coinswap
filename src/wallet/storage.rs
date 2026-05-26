@@ -7,7 +7,7 @@ use crate::{
     wallet::UTXOSpendInfo,
 };
 
-use super::{error::WalletError, fidelity::FidelityBond};
+use super::{chain::BdkChangeSet, error::WalletError, fidelity::FidelityBond};
 
 use bitcoin::{bip32::Xpriv, Network, OutPoint, ScriptBuf};
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,9 @@ use super::swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin};
 use bitcoind::bitcoincore_rpc::bitcoincore_rpc_json::ListUnspentResultEntry;
 
 /// Address type supported by the wallet for HD address generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 pub enum AddressType {
     /// BIP-84 Native SegWit (P2WPKH)
     #[default]
@@ -65,6 +67,16 @@ pub(crate) struct WalletStore {
     /// Maps transaction outpoints to their associated UTXO and spend information.
     #[serde(default)] // Ensures deserialization works if `utxo_cache` is missing
     pub(super) utxo_cache: HashMap<OutPoint, (ListUnspentResultEntry, UTXOSpendInfo)>,
+
+    /// Persisted BDK chain + indexed-tx-graph change sets driving wallet sync.
+    #[serde(default)]
+    pub(super) bdk: BdkChangeSet,
+
+    /// UTXOs the wallet has locked locally (replaces Core wallet's lock_unspent).
+    /// Locks are best-effort and do not persist meaning across restarts of the node;
+    /// they are persisted alongside the wallet so a process restart preserves them.
+    #[serde(default)]
+    pub(super) locked_outpoints: HashSet<OutPoint>,
 }
 
 impl WalletStore {
@@ -92,6 +104,8 @@ impl WalletStore {
             last_synced_height: None,
             wallet_birthday,
             utxo_cache: HashMap::new(),
+            bdk: BdkChangeSet::default(),
+            locked_outpoints: HashSet::new(),
         };
 
         std::fs::create_dir_all(path.parent().expect("Path should NOT be root!"))?;

@@ -2,6 +2,7 @@
 
 mod api;
 mod backup;
+pub(crate) mod chain;
 mod error;
 pub mod ffi;
 mod fidelity;

@@ -39,6 +39,7 @@ use bdk_coin_select::{
 };
 
 use super::{
+    chain::{BdkChain, SeedKeychain, WatchKey},
     error::WalletError,
     rpc::RPCConfig,
     storage::{AddressType, WalletStore},
@@ -54,7 +55,6 @@ const HARDENDED_DERIVATION_P2WPKH: &str = "m/84'/1'/0'";
 const HARDENDED_DERIVATION_P2TR: &str = "m/86'/1'/0'";
 
 /// Represents a Bitcoin wallet with associated functionality and data.
-#[derive(Debug)]
 pub struct Wallet {
     pub(crate) rpc: Client,
     pub(crate) wallet_file_path: PathBuf,
@@ -63,6 +63,19 @@ pub struct Wallet {
     /// If present, wallet data will be encrypted/decrypted using AES-GCM.
     /// The original passphrase is never stored—only the derived key is kept in memory.
     pub(crate) store_enc_material: Option<KeyMaterial>,
+    /// In-memory BDK chain + indexed-tx-graph state. Reconstructed from
+    /// `store.bdk` plus the authoritative swap/fidelity stores on load.
+    pub(crate) bdk: BdkChain,
+}
+
+impl std::fmt::Debug for Wallet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Wallet")
+            .field("wallet_file_path", &self.wallet_file_path)
+            .field("store", &self.store)
+            .field("store_enc_material", &self.store_enc_material)
+            .finish()
+    }
 }
 /// Compares two wallets for cryptographic equivalence.
 ///
@@ -103,7 +116,7 @@ impl PartialEq for Wallet {
 
 /// Specify the keychain derivation path from [`HARDENDED_DERIVATION_P2WPKH`] or [`HARDENDED_DERIVATION_P2TR`]
 /// Each kind represents an unhardened index value. Starting with External = 0.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy, Serialize, Deserialize)]
 pub(crate) enum KeychainKind {
     External = 0isize,
     Internal,
@@ -262,6 +275,57 @@ pub struct Balances {
 }
 
 impl Wallet {
+    /// Build a [`BdkChain`] from the persisted state in `store`, registering the four HD
+    /// seed keychains plus all currently-known swap/contract/fidelity watch scripts.
+    pub(crate) fn build_bdk_chain(store: &WalletStore) -> Result<BdkChain, WalletError> {
+        let mut seed = Vec::with_capacity(4);
+        for kc in SeedKeychain::all() {
+            seed.push((kc, kc.descriptor(&store.master_key)?));
+        }
+
+        let mut watch = Vec::new();
+        for sc in store.incoming_swapcoins.values() {
+            let txid = sc.contract_tx.compute_txid();
+            if let Some(ref multisig) = sc.multisig_redeemscript {
+                watch.push((
+                    WatchKey::Swap(txid),
+                    ScriptBuf::new_p2wsh(&multisig.wscript_hash()),
+                ));
+            }
+            if let Some(ref redeem) = sc.contract_redeemscript {
+                watch.push((
+                    WatchKey::Contract(txid),
+                    ScriptBuf::new_p2wsh(&redeem.wscript_hash()),
+                ));
+            }
+        }
+        for sc in store.outgoing_swapcoins.values() {
+            let txid = sc.contract_tx.compute_txid();
+            if let (Some(my_pk), Some(other_pk)) = (sc.my_pubkey, sc.other_pubkey) {
+                let multisig =
+                    crate::protocol::contract::create_multisig_redeemscript(&my_pk, &other_pk);
+                watch.push((
+                    WatchKey::Swap(txid),
+                    ScriptBuf::new_p2wsh(&multisig.wscript_hash()),
+                ));
+            }
+            if let Some(ref redeem) = sc.contract_redeemscript {
+                watch.push((
+                    WatchKey::Contract(txid),
+                    ScriptBuf::new_p2wsh(&redeem.wscript_hash()),
+                ));
+            }
+        }
+        for (idx, bond) in store.fidelity_bond.iter() {
+            watch.push((WatchKey::Fidelity(*idx), bond.script_pub_key()));
+        }
+        for spk in store.swept_incoming_swapcoins.iter() {
+            watch.push((WatchKey::Sweep(spk.clone()), spk.clone()));
+        }
+
+        BdkChain::load(store.network, &store.bdk, seed, watch)
+    }
+
     /// Initialize the wallet at a given path.
     ///
     /// The path should include the full path for a wallet file.
@@ -312,11 +376,13 @@ impl Wallet {
             last_synced_height_val
         );
 
+        let bdk = Self::build_bdk_chain(&store)?;
         Ok(Self {
             rpc,
             wallet_file_path: path.to_path_buf(),
             store,
             store_enc_material,
+            bdk,
         })
     }
     /// Get the wallet name
@@ -361,11 +427,13 @@ impl Wallet {
             store.outgoing_swapcoins.len()
         );
 
+        let bdk = Self::build_bdk_chain(&store)?;
         Ok(Self {
             rpc,
             wallet_file_path: path.to_path_buf(),
             store,
             store_enc_material,
+            bdk,
         })
     }
 
@@ -1543,6 +1611,158 @@ impl Wallet {
         Ok(())
     }
 
+    /// Master xpub fingerprint, used in synthesized descriptors for the legacy UTXO shim.
+    fn master_fingerprint(&self) -> bitcoin::bip32::Fingerprint {
+        let secp = Secp256k1::new();
+        Xpub::from_priv(&secp, &self.store.master_key).fingerprint()
+    }
+
+    /// Synthesize a Core-style descriptor string for an HD-derived UTXO so that
+    /// [`get_hd_path_from_descriptor`] continues to parse it. The output looks like
+    /// `wpkh([fingerprint/branch/index]...)` or `tr([fingerprint/branch/index]...)`.
+    fn synth_descriptor_for(&self, address_type: AddressType, branch: u32, index: u32) -> String {
+        let fp = self.master_fingerprint();
+        match address_type {
+            AddressType::P2WPKH => format!("wpkh([{fp}/{branch}/{index}])"),
+            AddressType::P2TR => format!("tr([{fp}/{branch}/{index}])"),
+        }
+    }
+
+    /// Synthesize a [`ListUnspentResultEntry`] from a BDK-tracked outpoint at the current
+    /// tip. Confirmations are derived from the chain position; UTXOs that are locked locally
+    /// are marked as not spendable.
+    fn synth_utxo_entry(
+        &self,
+        op: OutPoint,
+        full_txo: &bdk_chain::FullTxOut<bdk_chain::ConfirmationBlockTime>,
+        tip_height: u32,
+    ) -> ListUnspentResultEntry {
+        use bdk_chain::ChainPosition;
+
+        let (confirmations, safe) = match &full_txo.chain_position {
+            ChainPosition::Confirmed { anchor, .. } => {
+                let h = anchor.block_id.height;
+                (tip_height.saturating_sub(h) + 1, true)
+            }
+            ChainPosition::Unconfirmed { .. } => (0, false),
+        };
+
+        // Try to map the spk back to a known keychain so we can synthesize a parseable
+        // `descriptor` and `witness_script`.
+        let mut descriptor: Option<String> = None;
+        let mut witness_script: Option<ScriptBuf> = None;
+
+        if let Some((kc, idx)) = self.bdk.keychain_of_spk(&full_txo.txout.script_pubkey) {
+            descriptor = Some(self.synth_descriptor_for(kc.address_type, kc.kind.index_num(), idx));
+        } else {
+            // Not an HD spk — check watch keys for swap multisigs (where we can attach
+            // the witness_script). Other watch keys (contracts, fidelity, sweep) don't
+            // need a witness_script in the legacy entry.
+            let idx = self.bdk.graph.index.watch.index_of_spk(
+                full_txo.txout.script_pubkey.as_script(),
+            );
+            if let Some(super::chain::WatchKey::Swap(txid)) = idx {
+                // Find the corresponding multisig redeemscript in the swapcoin store.
+                if let Some(sc) = self.store.incoming_swapcoins.values().find(|s| {
+                    s.contract_tx.compute_txid() == *txid
+                }) {
+                    witness_script = sc.multisig_redeemscript.clone();
+                } else if let Some(sc) = self.store.outgoing_swapcoins.values().find(|s| {
+                    s.contract_tx.compute_txid() == *txid
+                }) {
+                    if let (Some(my_pk), Some(other_pk)) = (sc.my_pubkey, sc.other_pubkey) {
+                        witness_script = Some(
+                            crate::protocol::contract::create_multisig_redeemscript(
+                                &my_pk, &other_pk,
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
+        let address = Address::from_script(
+            &full_txo.txout.script_pubkey,
+            self.store.network,
+        )
+        .ok()
+        .map(|addr| {
+            // ListUnspentResultEntry uses NetworkUnchecked addresses
+            let s = addr.to_string();
+            bitcoin::Address::from_str(&s).expect("roundtrip").into_unchecked()
+        });
+
+        let spendable = !self.store.locked_outpoints.contains(&op);
+
+        ListUnspentResultEntry {
+            txid: op.txid,
+            vout: op.vout,
+            address,
+            label: None,
+            redeem_script: None,
+            witness_script,
+            script_pub_key: full_txo.txout.script_pubkey.clone(),
+            amount: full_txo.txout.value,
+            confirmations,
+            spendable,
+            solvable: true,
+            descriptor,
+            safe,
+        }
+    }
+
+    /// Recompute the legacy `utxo_cache` from BDK's canonical view. This replaces the
+    /// Bitcoin Core `listunspent` round-trip while keeping the existing `(utxo, spend_info)`
+    /// consumers untouched.
+    pub(crate) fn refresh_utxo_cache_from_bdk(&mut self) -> Result<(), WalletError> {
+        use bdk_chain::CanonicalizationParams;
+
+        let tip = self.bdk.chain.tip();
+        let tip_height = tip.height();
+
+        // Combine HD-keychain outpoints with watch-script outpoints.
+        let hd_outpoints: Vec<(super::chain::SeedKeychain, OutPoint)> = self
+            .bdk
+            .graph
+            .index
+            .seed
+            .outpoints()
+            .iter()
+            .map(|((kc, _), op)| (*kc, *op))
+            .collect();
+        let watch_outpoints: Vec<(super::chain::WatchKey, OutPoint)> = self
+            .bdk
+            .graph
+            .index
+            .watch
+            .outpoints()
+            .iter()
+            .map(|(k, op)| (k.clone(), *op))
+            .collect();
+
+        let view = self.bdk.graph.canonical_view(
+            &self.bdk.chain,
+            tip.block_id(),
+            CanonicalizationParams::default(),
+        );
+
+        let mut entries: Vec<ListUnspentResultEntry> = Vec::new();
+        for (_, full_txo) in view.filter_unspent_outpoints(hd_outpoints.into_iter()) {
+            entries.push(self.synth_utxo_entry(full_txo.outpoint, &full_txo, tip_height));
+        }
+        for (_, full_txo) in view.filter_unspent_outpoints(watch_outpoints.into_iter()) {
+            // Skip duplicates — an outpoint may be reachable through both an HD spk and a
+            // watch spk (e.g. swept-incoming coins).
+            if entries.iter().any(|e| e.txid == full_txo.outpoint.txid && e.vout == full_txo.outpoint.vout) {
+                continue;
+            }
+            entries.push(self.synth_utxo_entry(full_txo.outpoint, &full_txo, tip_height));
+        }
+
+        self.update_utxo_cache(entries);
+        Ok(())
+    }
+
     /// Gets a tweakable key pair from the master key of the wallet.
     pub(crate) fn get_tweakable_keypair(&self) -> Result<(SecretKey, PublicKey), WalletError> {
         let secp = Secp256k1::new();
@@ -2116,20 +2336,25 @@ impl Wallet {
     ) -> Result<(Address, SecretKey), WalletError> {
         let (my_pubkey, my_privkey) = generate_keypair();
 
-        let descriptor = self
-            .rpc
-            .get_descriptor_info(&format!("wsh(sortedmulti(2,{my_pubkey},{other_pubkey}))"))?
-            .descriptor;
-        self.import_descriptors(std::slice::from_ref(&descriptor), None, None)?;
+        // Build the 2-of-2 sorted-multisig redeem script + corresponding P2WSH address locally
+        // (no Core RPC needed). The descriptor lives only inside BDK's SpkTxOutIndex now.
+        let multisig =
+            crate::protocol::contract::create_multisig_redeemscript(&my_pubkey, other_pubkey);
+        let multisig_spk = ScriptBuf::new_p2wsh(&multisig.wscript_hash());
+        let address = Address::from_script(&multisig_spk, self.store.network)
+            .map_err(|e| WalletError::General(format!("multisig address: {e}")))?;
 
-        // redeemscript and descriptor show up in `getaddressinfo` only after
-        // the address gets outputs on it-
-        Ok((
-            self.rpc.derive_addresses(&descriptor[..], None)?[0]
-                .clone()
-                .assume_checked(),
-            my_privkey,
-        ))
+        // We don't know the eventual contract txid yet, so register this watch key
+        // using a hash of the multisig script. When the swapcoin is later added,
+        // `build_bdk_chain`'s rebuilds and any subsequent `sync()` insertion will
+        // re-key it under `WatchKey::Swap(contract_txid)` (idempotent w.r.t. UTXOs).
+        use bitcoin::hashes::Hash as _;
+        // Use a double-SHA256 of the multisig script (matches the bitcoin txid hash type).
+        let hash_bytes = bitcoin::hashes::sha256d::Hash::hash(multisig.as_bytes());
+        let pseudo_txid = bitcoin::Txid::from_raw_hash(hash_bytes);
+        self.bdk.watch(super::chain::WatchKey::Swap(pseudo_txid), multisig_spk);
+
+        Ok((address, my_privkey))
     }
 
     pub(crate) fn descriptors_to_import(&self) -> Result<Vec<String>, WalletError> {
