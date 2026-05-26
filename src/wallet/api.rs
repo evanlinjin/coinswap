@@ -1669,10 +1669,10 @@ impl Wallet {
         );
 
         let mut entries: Vec<ListUnspentResultEntry> = Vec::new();
-        for (_, full_txo) in view.filter_unspent_outpoints(hd_outpoints.into_iter()) {
+        for (_, full_txo) in view.filter_unspent_outpoints(hd_outpoints) {
             entries.push(self.synth_utxo_entry(full_txo.outpoint, &full_txo, tip_height));
         }
-        for (_, full_txo) in view.filter_unspent_outpoints(watch_outpoints.into_iter()) {
+        for (_, full_txo) in view.filter_unspent_outpoints(watch_outpoints) {
             // Skip duplicates — an outpoint may be reachable through both an HD spk and a
             // watch spk (e.g. swept-incoming coins).
             if entries.iter().any(|e| e.txid == full_txo.outpoint.txid && e.vout == full_txo.outpoint.vout) {

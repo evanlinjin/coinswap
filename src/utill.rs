@@ -43,12 +43,17 @@ use crate::{
     wallet::{UTXOSpendInfo, WalletError},
 };
 
+#[allow(dead_code)]
 const INPUT_CHARSET: &str =
     "0123456789()[],'/*abcdefgh@:$%{}IJKLMNOPQRSTUVWXYZ&+-.;<=>?!^_|~ijklmnopqrstuvwxyzABCDEFGH`#\"\\ ";
+#[allow(dead_code)]
 const CHECKSUM_CHARSET: &str = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 
+#[allow(dead_code)]
 const MASK_LOW_35_BITS: u64 = 0x7ffffffff;
+#[allow(dead_code)]
 const SHIFT_FOR_C0: u64 = 35;
+#[allow(dead_code)]
 const CHECKSUM_FINAL_XOR_VALUE: u64 = 1;
 
 /// Global heartbeat interval used during waiting periods in critical situations.
@@ -345,6 +350,7 @@ pub(crate) fn parse_field<T: std::str::FromStr>(value: Option<&String>, default:
         .unwrap_or(default)
 }
 
+#[allow(dead_code)]
 fn polynomial_modulus(mut checksum: u64, value: u64) -> u64 {
     let upper_bits = checksum >> SHIFT_FOR_C0;
     checksum = ((checksum & MASK_LOW_35_BITS) << 5) ^ value;
@@ -407,6 +413,7 @@ pub(crate) fn parse_checked_address(
 }
 
 /// Compute the checksum of a descriptor
+#[allow(dead_code)]
 pub(crate) fn compute_checksum(descriptor: &str) -> Result<String, WalletError> {
     let mut checksum = CHECKSUM_FINAL_XOR_VALUE;
     let mut accumulated_value = 0;

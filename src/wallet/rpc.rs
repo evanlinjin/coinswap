@@ -130,11 +130,7 @@ impl Wallet {
             .mempool()
             .map_err(WalletError::Rpc)?;
         if !mempool.update.is_empty() {
-            let unconf = mempool
-                .update
-                .into_iter()
-                .map(|(tx, seen_at)| (tx, seen_at));
-            let mempool_cs = self.bdk.graph.batch_insert_relevant_unconfirmed(unconf);
+            let mempool_cs = self.bdk.graph.batch_insert_relevant_unconfirmed(mempool.update);
             self.store.bdk.indexed_tx_graph.merge(mempool_cs);
         }
 
