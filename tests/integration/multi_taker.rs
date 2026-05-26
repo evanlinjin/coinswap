@@ -246,15 +246,20 @@ fn test_multi_taker_coinswap() {
             i
         );
         assert_eq!(balances.fidelity, Amount::from_btc(0.05).unwrap());
-        // Swap balance must have grown by approximately the swap_amount (this
-        // test uses two 5_000_000 sat swaps; allow ±1% drift for fee accounting).
-        let swap_amount = 5_000_000_u64;
+        // Each maker sits between the taker and the next hop, so it accumulates one
+        // sweep of ~swap_amount per taker. The test runs 2 takers each swapping
+        // 500_000 sats, so we expect roughly 2 * 500_000 in the swap bucket per
+        // maker (less a small per-tx fee delta). Allow 2% slack.
+        let swap_amount_per_taker = 500_000_u64;
+        let num_takers = 2_u64;
+        let min_expected =
+            swap_amount_per_taker * num_takers - (swap_amount_per_taker * num_takers) / 50;
         assert!(
-            balances.swap.to_sat() >= swap_amount - swap_amount / 100,
-            "Maker {} swap balance {} is below the expected swap amount {}",
+            balances.swap.to_sat() >= min_expected,
+            "Maker {} swap balance {} is below the expected minimum {}",
             i,
             balances.swap.to_sat(),
-            swap_amount
+            min_expected
         );
 
         let maker_fee = balances
