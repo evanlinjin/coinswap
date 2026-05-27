@@ -254,20 +254,6 @@ impl BdkChain {
         Ok(Self { chain, graph })
     }
 
-    /// Reveal HD scripts up to (and including) `target` for the given keychain.
-    pub(crate) fn reveal_to(
-        &mut self,
-        keychain: SeedKeychain,
-        target: u32,
-    ) -> bdk_chain::keychain_txout::ChangeSet {
-        self.graph
-            .index
-            .seed
-            .reveal_to_target(keychain, target)
-            .map(|(_, cs)| cs)
-            .unwrap_or_default()
-    }
-
     /// Script for the given (keychain, index) pair, deriving lazily within the lookahead window.
     pub(crate) fn spk_at(&self, keychain: SeedKeychain, index: u32) -> Option<ScriptBuf> {
         self.graph.index.seed.spk_at_index(keychain, index)

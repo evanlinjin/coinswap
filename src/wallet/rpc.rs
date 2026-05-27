@@ -7,15 +7,13 @@
 use std::{convert::TryFrom, thread};
 
 use bdk_bitcoind_rpc::{Emitter, NO_EXPECTED_MEMPOOL_TXS};
-use bdk_chain::{
-    keychain_txout::ChangeSet as KeychainChangeSet, local_chain::CannotConnectError, Merge,
-};
+use bdk_chain::{local_chain::CannotConnectError, Merge};
 use bitcoind::bitcoincore_rpc::{Auth, Client, RpcApi};
 use serde_json::json;
 
 use crate::utill::HEART_BEAT_INTERVAL;
 
-use super::{chain::SeedKeychain, error::WalletError, Wallet};
+use super::{error::WalletError, Wallet};
 
 /// Configuration parameters for connecting to a Bitcoin node via RPC.
 #[derive(Debug, Clone)]
@@ -70,10 +68,6 @@ impl Wallet {
 
     /// Sync the wallet with the configured Bitcoin Core node via BDK's Emitter.
     fn sync(&mut self) -> Result<(), WalletError> {
-        // Make sure BDK has revealed enough HD scripts to cover all currently-issued
-        // external addresses. (Internal scripts are revealed on-demand by the spend path.)
-        self.ensure_revealed_to_external_index()?;
-
         // Resume sync from the BDK chain's tip; on a fresh wallet the tip is genesis so we
         // fall back to wallet_birthday (or 0 if no birthday is known) to skip ahead.
         let chain_tip_height = self.bdk.chain.tip().height();
@@ -120,37 +114,8 @@ impl Wallet {
             self.store.bdk.indexed_tx_graph.merge(mempool_cs);
         }
 
-        // Refresh the legacy `utxo_cache` shim so existing call sites see up-to-date UTXOs.
-        self.refresh_utxo_cache_from_bdk()?;
-
-        // Ensure `external_index` doesn't lag behind addresses that actually saw payments
-        // (e.g. on a wallet restored from an older backup). We bump it past the highest
-        // *used* external index across both HD address types — never past spk indices we
-        // only revealed via the lookahead window, which would over-eagerly advance the
-        // counter on every sync.
-        let max_used = SeedKeychain::all()
-            .iter()
-            .filter(|kc| kc.kind == super::api::KeychainKind::External)
-            .filter_map(|kc| self.bdk.graph.index.seed.last_used_index(*kc))
-            .map(|i| i + 1)
-            .max()
-            .unwrap_or(0);
-        self.store.external_index = self.store.external_index.max(max_used);
-
         self.refresh_offer_maxsize_cache()?;
 
-        Ok(())
-    }
-
-    /// Reveal HD scripts up to (and including) `external_index` for every HD keychain.
-    /// `external_index` is the next-to-issue index, so we reveal `external_index` itself
-    /// to ensure the lookahead window straddles it.
-    fn ensure_revealed_to_external_index(&mut self) -> Result<(), WalletError> {
-        let target = self.store.external_index;
-        for kc in SeedKeychain::all() {
-            let cs: KeychainChangeSet = self.bdk.reveal_to(kc, target);
-            self.store.bdk.indexed_tx_graph.indexer.merge(cs);
-        }
         Ok(())
     }
 

@@ -68,37 +68,17 @@ impl std::fmt::Debug for Wallet {
 }
 /// Compares two wallets for cryptographic equivalence.
 ///
-/// This comparison checks fields relevant to the cryptographic and functional
-/// state of the wallet, intentionally excluding fields that are:
-/// - related to file metadata (like `file_name`),
-/// - transient or runtime-only (e.g., swap coins, sync height),
-/// - dynamic (e.g., `prevout_to_contract_map`).
-///
-/// The fields checked include:
-/// - `network`
-/// - `master_key`
-/// - `external_index`
-/// - `offer_maxsize`
-/// - `fidelity_bond`
-/// - `wallet_birthday`
-/// - `utxo_cache`
-///
-/// This allows comparing whether two wallets represent the same core cryptographic
-/// identity and logic state, regardless of runtime or file system differences.
+/// Checks fields relevant to the cryptographic and functional identity of the wallet:
+/// network, master key, offer-maxsize cache, fidelity bonds, and wallet birthday.
+/// Intentionally excludes file metadata, transient sync state, and dynamic per-swap
+/// state (incoming/outgoing swapcoins, prevout-to-contract map).
 impl PartialEq for Wallet {
     fn eq(&self, other: &Self) -> bool {
-        //self.store == other.store
-        //avoided filename
-        self.store.network == other.store.network &&
-        self.store.master_key == other.store.master_key &&
-        self.store.external_index == other.store.external_index &&
-        self.store.offer_maxsize == other.store.offer_maxsize &&
-        //avoided incoming_swapcoins
-        //avoided outgoing_swapcoins
-        //avoided prevout_to_contract_map
-        self.store.fidelity_bond == other.store.fidelity_bond &&
-        self.store.wallet_birthday == other.store.wallet_birthday &&
-        self.store.utxo_cache == other.store.utxo_cache
+        self.store.network == other.store.network
+            && self.store.master_key == other.store.master_key
+            && self.store.offer_maxsize == other.store.offer_maxsize
+            && self.store.fidelity_bond == other.store.fidelity_bond
+            && self.store.wallet_birthday == other.store.wallet_birthday
     }
 }
 
@@ -409,9 +389,8 @@ impl Wallet {
             return Err(WalletError::General("Wrong Bitcoin Network".to_string()));
         }
         log::debug!(
-            "Loaded wallet file {} | External Index = {} | Incoming = {} | Outgoing = {}",
+            "Loaded wallet file {} | Incoming = {} | Outgoing = {}",
             store.file_name,
-            store.external_index,
             store.incoming_swapcoins.len(),
             store.outgoing_swapcoins.len()
         );
@@ -1099,9 +1078,16 @@ impl Wallet {
         Ok(())
     }
 
-    /// Gets the external index from the wallet.
-    pub fn get_external_index(&self) -> &u32 {
-        &self.store.external_index
+    /// Gets the next-to-issue external HD index (across both address types) from BDK.
+    /// Returns 0 if no external scripts have been revealed yet.
+    pub fn get_external_index(&self) -> u32 {
+        use super::chain::SeedKeychain;
+        SeedKeychain::all()
+            .iter()
+            .filter(|kc| kc.kind == KeychainKind::External)
+            .filter_map(|kc| self.bdk.graph.index.seed.next_index(*kc).map(|(i, _)| i))
+            .max()
+            .unwrap_or(0)
     }
 
     /// Locks the fidelity and live_contract utxos which are not considered for spending from the wallet.
@@ -1111,20 +1097,19 @@ impl Wallet {
     pub fn lock_unspendable_utxos(&mut self) -> Result<(), WalletError> {
         self.store.locked_outpoints.clear();
 
-        // Walk the cached UTXOs and lock any that aren't a regular seed coin or swap coin —
+        // Walk the current UTXOs and lock any that aren't a regular seed coin or swap coin —
         // i.e. fidelity bonds, live contracts, etc.
         let to_lock: Vec<OutPoint> = self
-            .store
-            .utxo_cache
-            .iter()
-            .filter_map(|(op, (utxo, _spend_info))| {
+            .list_all_utxo_spend_info()
+            .into_iter()
+            .filter_map(|(utxo, _info)| {
                 if self
-                    .check_and_derive_descriptor_utxo_or_swap_coin(utxo)
+                    .check_and_derive_descriptor_utxo_or_swap_coin(&utxo)
                     .ok()
                     .flatten()
                     .is_none()
                 {
-                    Some(*op)
+                    Some(utxo.outpoint)
                 } else {
                     None
                 }
@@ -1292,13 +1277,63 @@ impl Wallet {
     /// full list of utxo is fetched from core rpc.
     #[hotpath::measure]
     pub fn list_all_utxo_spend_info(&self) -> Vec<(Utxo, UTXOSpendInfo)> {
-        let processed_utxos = self
-            .store
-            .utxo_cache
-            .values()
-            .map(|(utxo, spend_info)| (utxo.clone(), spend_info.clone()))
-            .collect();
-        processed_utxos
+        use bdk_chain::CanonicalizationParams;
+
+        let tip = self.bdk.chain.tip();
+        let tip_height = tip.height();
+
+        // Collect (key, outpoint) pairs for every spk the wallet tracks — both HD
+        // (seed) and fixed (watch) — then ask BDK for the unspent ones at the tip.
+        let hd_outpoints = self
+            .bdk
+            .graph
+            .index
+            .seed
+            .outpoints()
+            .iter()
+            .map(|((_, _), op)| ((), *op));
+        let watch_outpoints = self
+            .bdk
+            .graph
+            .index
+            .watch
+            .outpoints()
+            .iter()
+            .map(|(_, op)| ((), *op));
+
+        let view = self.bdk.graph.canonical_view(
+            &self.bdk.chain,
+            tip.block_id(),
+            CanonicalizationParams::default(),
+        );
+
+        let mut seen = std::collections::HashSet::<OutPoint>::new();
+        let mut out = Vec::new();
+        for (_, full_txo) in view.filter_unspent_outpoints(hd_outpoints.chain(watch_outpoints)) {
+            if !seen.insert(full_txo.outpoint) {
+                continue;
+            }
+            let utxo = self.synth_utxo_entry(full_txo.outpoint, &full_txo, tip_height);
+            // Classify; UTXOs that match a fidelity bond, live contract, seed coin, or swap
+            // coin go into the result with their spend info. Anything else (e.g. a payment
+            // to a script we're watching but don't know how to spend) is dropped.
+            let spend_info = self
+                .check_if_fidelity(&utxo)
+                .or_else(|| {
+                    self.check_and_derive_live_contract_spend_info(&utxo)
+                        .ok()
+                        .flatten()
+                })
+                .or_else(|| {
+                    self.check_and_derive_descriptor_utxo_or_swap_coin(&utxo)
+                        .ok()
+                        .flatten()
+                });
+            if let Some(info) = spend_info {
+                out.push((utxo, info));
+            }
+        }
+        out
     }
 
     /// Lists live contract UTXOs along with their Spend info.
@@ -1441,19 +1476,17 @@ impl Wallet {
             address_type,
             kind: KeychainKind::External,
         };
-        let idx = self.store.external_index;
-        // Reveal up to this index so the spk is known to BDK; ignore the (deltas) ChangeSet
-        // because the next sync will roll it into store.bdk via the regular merge path.
-        let _ = self.bdk.reveal_to(kc, idx);
-        let spk = self.bdk.spk_at(kc, idx).ok_or_else(|| {
-            WalletError::General(format!(
-                "BDK could not derive spk for {:?} at index {idx}",
-                kc
-            ))
-        })?;
+        let ((_, spk), cs) = self
+            .bdk
+            .graph
+            .index
+            .seed
+            .reveal_next_spk(kc)
+            .ok_or_else(|| WalletError::General(format!("BDK keychain not registered: {kc:?}")))?;
+        use bdk_chain::Merge;
+        self.store.bdk.indexed_tx_graph.indexer.merge(cs);
         let address = Address::from_script(&spk, self.store.network)
             .map_err(|e| WalletError::General(format!("address from spk: {e}")))?;
-        self.store.external_index += 1;
         self.save_to_disk()?;
         Ok(address)
     }
@@ -1547,58 +1580,6 @@ impl Wallet {
         }
     }
 
-    /// Recompute the legacy `utxo_cache` from BDK's canonical view. This replaces the
-    /// Bitcoin Core `listunspent` round-trip while keeping the existing `(utxo, spend_info)`
-    /// consumers untouched.
-    pub(crate) fn refresh_utxo_cache_from_bdk(&mut self) -> Result<(), WalletError> {
-        use bdk_chain::CanonicalizationParams;
-
-        let tip = self.bdk.chain.tip();
-        let tip_height = tip.height();
-
-        // Combine HD-keychain outpoints with watch-script outpoints.
-        let hd_outpoints: Vec<(super::chain::SeedKeychain, OutPoint)> = self
-            .bdk
-            .graph
-            .index
-            .seed
-            .outpoints()
-            .iter()
-            .map(|((kc, _), op)| (*kc, *op))
-            .collect();
-        let watch_outpoints: Vec<(super::chain::WatchKey, OutPoint)> = self
-            .bdk
-            .graph
-            .index
-            .watch
-            .outpoints()
-            .iter()
-            .map(|(k, op)| (k.clone(), *op))
-            .collect();
-
-        let view = self.bdk.graph.canonical_view(
-            &self.bdk.chain,
-            tip.block_id(),
-            CanonicalizationParams::default(),
-        );
-
-        let mut entries: Vec<Utxo> = Vec::new();
-        for (_, full_txo) in view.filter_unspent_outpoints(hd_outpoints) {
-            entries.push(self.synth_utxo_entry(full_txo.outpoint, &full_txo, tip_height));
-        }
-        for (_, full_txo) in view.filter_unspent_outpoints(watch_outpoints) {
-            // Skip duplicates — an outpoint may be reachable through both an HD spk and a
-            // watch spk (e.g. swept-incoming coins).
-            if entries.iter().any(|e| e.outpoint == full_txo.outpoint) {
-                continue;
-            }
-            entries.push(self.synth_utxo_entry(full_txo.outpoint, &full_txo, tip_height));
-        }
-
-        self.update_utxo_cache(entries);
-        Ok(())
-    }
-
     /// Gets a tweakable key pair from the master key of the wallet.
     pub(crate) fn get_tweakable_keypair(&self) -> Result<(SecretKey, PublicKey), WalletError> {
         let secp = Secp256k1::new();
@@ -1613,68 +1594,6 @@ impl Wallet {
             inner: privkey.public_key(&secp),
         };
         Ok((privkey, public_key))
-    }
-
-    /// Refreshes the UTXO cache by adding only new UTXOs while preserving existing ones.
-    pub(crate) fn update_utxo_cache(&mut self, utxos: Vec<Utxo>) {
-        let mut new_entries = Vec::new();
-        let existing_outpoints: std::collections::HashSet<OutPoint> = utxos
-            .iter()
-            .map(|utxo| OutPoint {
-                txid: utxo.txid(),
-                vout: utxo.vout(),
-            })
-            .collect();
-
-        // Identify UTXOs to be removed (present in store but missing in utxos parameter passed)
-        let mut to_remove = Vec::new();
-        for existing_outpoint in self.store.utxo_cache.keys().cloned().collect::<Vec<_>>() {
-            if !existing_outpoints.contains(&existing_outpoint) {
-                to_remove.push(existing_outpoint);
-            }
-        }
-
-        // Remove UTXOs that no longer exist in the received utxos list
-        for outpoint in to_remove {
-            self.store.utxo_cache.remove(&outpoint);
-            log::debug!("[UTXO Cache] Removed UTXO: {outpoint:?}");
-        }
-
-        // Process and add only new UTXOs
-        for utxo in utxos {
-            let outpoint = OutPoint {
-                txid: utxo.txid(),
-                vout: utxo.vout(),
-            };
-
-            // Skip if the UTXO already exists in the cache
-            if self.store.utxo_cache.contains_key(&outpoint) {
-                continue;
-            }
-
-            // Process UTXOs to pair each with it's spend info using the wallet's private methods.
-            let spend_info = self
-                .check_if_fidelity(&utxo)
-                .or_else(|| {
-                    self.check_and_derive_live_contract_spend_info(&utxo)
-                        .unwrap()
-                })
-                .or_else(|| {
-                    self.check_and_derive_descriptor_utxo_or_swap_coin(&utxo)
-                        .unwrap()
-                });
-
-            // If we found valid spend info, store it in the cache
-            if let Some(info) = spend_info {
-                log::debug!("[UTXO Cache] Added UTXO: {outpoint:?} -> {info:?}");
-                new_entries.push((outpoint, (utxo, info)));
-            }
-        }
-
-        // Insert only new entries into the cache
-        for (outpoint, entry) in new_entries {
-            self.store.utxo_cache.insert(outpoint, entry);
-        }
     }
 
     /// Signs a transaction corresponding to the provided UTXO spend information.

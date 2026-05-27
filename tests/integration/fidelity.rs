@@ -355,7 +355,11 @@ fn test_fidelity_spending() {
         );
         log::info!("Total UTXOs in wallet: {}", all_utxos.len());
 
-        (fidelity_utxo.txid(), fidelity_utxo.vout(), fidelity_utxo.amount)
+        (
+            fidelity_utxo.txid(),
+            fidelity_utxo.vout(),
+            fidelity_utxo.amount,
+        )
     };
 
     let check_fidelity_utxo_integrity = |iteration: usize| {

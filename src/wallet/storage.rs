@@ -2,10 +2,7 @@
 //!
 //! Wallet data is currently written in unencrypted CBOR files which are not directly human readable.
 
-use crate::{
-    security::{encrypt_struct, load_sensitive_struct, KeyMaterial, SerdeCbor},
-    wallet::UTXOSpendInfo,
-};
+use crate::security::{encrypt_struct, load_sensitive_struct, KeyMaterial, SerdeCbor};
 
 use super::{chain::BdkChangeSet, error::WalletError, fidelity::FidelityBond};
 
@@ -19,8 +16,6 @@ use std::{
 };
 
 use super::swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin};
-
-use super::api::Utxo;
 
 /// Address type supported by the wallet for HD address generation.
 #[derive(
@@ -43,8 +38,6 @@ pub(crate) struct WalletStore {
     pub(crate) network: Network,
     /// The master key for the wallet.
     pub(super) master_key: Xpriv,
-    /// The external index for the wallet.
-    pub(super) external_index: u32,
     /// The maximum size for an offer in the wallet.
     pub(crate) offer_maxsize: u64,
     /// Map of swap_id to incoming swapcoins.
@@ -61,10 +54,6 @@ pub(crate) struct WalletStore {
     /// Map for all the fidelity bond information.
     pub(crate) fidelity_bond: HashMap<u32, FidelityBond>,
     pub(super) wallet_birthday: Option<u64>,
-
-    /// Maps transaction outpoints to their associated UTXO and spend information.
-    #[serde(default)] // Ensures deserialization works if `utxo_cache` is missing
-    pub(super) utxo_cache: HashMap<OutPoint, (Utxo, UTXOSpendInfo)>,
 
     /// Persisted BDK chain + indexed-tx-graph change sets driving wallet sync.
     #[serde(default)]
@@ -91,7 +80,6 @@ impl WalletStore {
             file_name,
             network,
             master_key,
-            external_index: 0,
             offer_maxsize: 0,
             incoming_swapcoins: HashMap::new(),
             outgoing_swapcoins: HashMap::new(),
@@ -100,7 +88,6 @@ impl WalletStore {
             swept_incoming_swapcoins: HashSet::new(),
             fidelity_bond: HashMap::new(),
             wallet_birthday,
-            utxo_cache: HashMap::new(),
             bdk: BdkChangeSet::default(),
             locked_outpoints: HashSet::new(),
         };
