@@ -1097,9 +1097,11 @@ impl Wallet {
     ///
     /// "Lock" here means adding to the wallet's local `locked_outpoints` set;
     /// the wallet's spend paths consult this set instead of Core's locked-utxo list.
+    ///
+    /// Caller-set locks are preserved — this method only *adds* to the set; it never
+    /// removes existing locks. Callers wanting a clean slate should call
+    /// [`Self::unlock_all_outpoints`] first.
     pub fn lock_unspendable_utxos(&mut self) -> Result<(), WalletError> {
-        self.store.locked_outpoints.clear();
-
         // Walk the current UTXOs and lock any that aren't a regular seed coin or swap coin —
         // i.e. fidelity bonds, live contracts, etc.
         let to_lock: Vec<OutPoint> = self
