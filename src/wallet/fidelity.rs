@@ -359,14 +359,15 @@ impl Wallet {
         &self,
         locktime: LockTime,
     ) -> Result<(u32, Address, PublicKey), WalletError> {
-        // Check what was the last fidelity address index.
-        // Derive a fidelity address
+        // Next fidelity-bond index: one past the *maximum* existing index. Using
+        // `keys().max()` (not `keys().last()`, whose order is unspecified for HashMap)
+        // ensures we don't accidentally hand out an index that's already taken.
         let next_index = self
             .store
             .fidelity_bond
             .keys()
-            .map(|i| *i + 1)
-            .last()
+            .max()
+            .map(|i| i + 1)
             .unwrap_or(0);
 
         let fidelity_pubkey = PublicKey {
