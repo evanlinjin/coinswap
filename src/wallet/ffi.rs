@@ -9,7 +9,20 @@ use crate::{
     wallet::{AddressType, Destination, RPCConfig, Wallet, WalletBackup, WalletError},
 };
 use bitcoin::{Amount, OutPoint, Txid};
-use bitcoind::bitcoincore_rpc::{json::ListTransactionResult, RpcApi};
+use serde::{Deserialize, Serialize};
+
+/// A wallet-owned summary record of an incoming transaction. Replaces the bitcoincore-rpc
+/// `ListTransactionResult` shape that the wallet used to return when Bitcoin Core was the
+/// UTXO source. Carries only the fields the GUI actually surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IncomingTx {
+    /// The transaction id.
+    pub txid: Txid,
+    /// Sum of values paid to scripts the wallet owns in this tx.
+    pub amount: Amount,
+    /// Confirmations of the tx (0 if unconfirmed).
+    pub confirmations: u32,
+}
 use std::path::{Path, PathBuf};
 
 pub use super::report::{
@@ -120,13 +133,48 @@ impl Wallet {
         }
     }
 
-    /// Returns a list of recent Incoming Transactions (bydefault last 10)
+    /// Returns a list of recent incoming transactions to the wallet (by default last 10).
+    ///
+    /// A transaction is "incoming" if it has at least one output paying a script the wallet
+    /// owns (HD seed coin or swept-incoming swap coin). The list is sorted by confirmation
+    /// height descending (most recent first); `skip` and `count` paginate the result.
     pub fn get_transactions(
         &self,
         count: Option<usize>,
         skip: Option<usize>,
-    ) -> Result<Vec<ListTransactionResult>, WalletError> {
-        Ok(self.rpc.list_transactions(None, count, skip, Some(true))?)
+    ) -> Result<Vec<IncomingTx>, WalletError> {
+        let count = count.unwrap_or(10);
+        let skip = skip.unwrap_or(0);
+
+        // Group every (Utxo, UTXOSpendInfo) pair whose spend_info is a SeedCoin or
+        // SweptCoin by parent txid, and sum the value paid to our scripts.
+        use std::collections::BTreeMap;
+        let mut by_txid: BTreeMap<Txid, IncomingTx> = BTreeMap::new();
+        for (utxo, info) in self.list_all_utxo_spend_info() {
+            let is_incoming = matches!(
+                info,
+                super::api::UTXOSpendInfo::SeedCoin { .. }
+                    | super::api::UTXOSpendInfo::SweptCoin { .. }
+            );
+            if !is_incoming {
+                continue;
+            }
+            let entry = by_txid.entry(utxo.txid()).or_insert(IncomingTx {
+                txid: utxo.txid(),
+                amount: Amount::ZERO,
+                confirmations: utxo.confirmations,
+            });
+            entry.amount += utxo.amount;
+            // Take the lowest confirmations across all outputs of the tx.
+            if utxo.confirmations < entry.confirmations {
+                entry.confirmations = utxo.confirmations;
+            }
+        }
+
+        let mut rows: Vec<IncomingTx> = by_txid.into_values().collect();
+        // Most-recent (lowest confirmations) first.
+        rows.sort_by_key(|r| r.confirmations);
+        Ok(rows.into_iter().skip(skip).take(count).collect())
     }
 
     /// Sends specified Amount of Satoshis to an External Address
