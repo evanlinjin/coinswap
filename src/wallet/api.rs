@@ -477,13 +477,20 @@ impl Wallet {
         self.store
             .outgoing_swapcoins
             .insert(key.clone(), coin.clone());
-        if let (Some(my_pk), Some(other_pk)) = (coin.my_pubkey, coin.other_pubkey) {
-            let multisig =
-                crate::protocol::contract::create_multisig_redeemscript(&my_pk, &other_pk);
-            self.bdk.watch(
-                super::chain::WatchKey::Swap(multisig.clone()),
-                ScriptBuf::new_p2wsh(&multisig.wscript_hash()),
-            );
+        // Only Legacy swapcoins have a wsh(2-of-2-multisig) funding output that BDK can
+        // index. Taproot swapcoins also set my_pubkey/other_pubkey (via
+        // `set_taproot_params`), but their actual funding output is a P2TR MuSig2
+        // aggregate — registering a derived P2WSH spk would just pollute the watch
+        // index with an unreachable script.
+        if coin.protocol == crate::protocol::ProtocolVersion::Legacy {
+            if let (Some(my_pk), Some(other_pk)) = (coin.my_pubkey, coin.other_pubkey) {
+                let multisig =
+                    crate::protocol::contract::create_multisig_redeemscript(&my_pk, &other_pk);
+                self.bdk.watch(
+                    super::chain::WatchKey::Swap(multisig.clone()),
+                    ScriptBuf::new_p2wsh(&multisig.wscript_hash()),
+                );
+            }
         }
         if let Some(ref redeem) = coin.contract_redeemscript {
             self.bdk.watch(
@@ -515,15 +522,14 @@ impl Wallet {
         self.store.incoming_swapcoins.get_mut(contract_txid)
     }
 
-    /// Finds a outgoing swap coin by multisig redeemscript.
     /// Find a Legacy outgoing swapcoin whose 2-of-2 multisig redeem script equals
     /// `multisig_redeemscript`. Used by the UTXO classifier to recognize wsh-multisig
     /// outputs that BDK's `SpkTxOutIndex` matched as `WatchKey::Swap`.
     ///
-    /// Taproot swapcoins are intentionally skipped: their funding output is a P2TR
-    /// MuSig2 aggregate (not a wsh-sortedmulti), and they are not registered with
-    /// BDK as `WatchKey::Swap` — they are tracked via the contract_tx stored in
-    /// `outgoing_swapcoins` and verified via direct `get_tx_out` lookups.
+    /// Taproot swapcoins are intentionally skipped: only Legacy swaps have a P2WSH
+    /// 2-of-2-multisig funding output, and `add_outgoing_swapcoin` only registers a
+    /// `WatchKey::Swap` for Legacy. Taproot funding outputs are P2TR MuSig2 aggregates
+    /// and are tracked via `contract_tx` lookups, not via BDK watch keys.
     pub(crate) fn find_outgoing_swapcoin_by_multisig(
         &self,
         multisig_redeemscript: &ScriptBuf,
