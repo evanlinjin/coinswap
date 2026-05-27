@@ -1124,16 +1124,24 @@ impl Wallet {
         Ok(())
     }
 
-    /// Unlock all locally-locked outpoints.
+    /// Unlock all locally-locked outpoints. Persists to disk; a save failure is logged
+    /// at warn level — the in-memory state is still updated.
     pub fn unlock_all_outpoints(&mut self) {
         self.store.locked_outpoints.clear();
+        if let Err(e) = self.save_to_disk() {
+            log::warn!("failed to persist unlock_all_outpoints: {e:?}");
+        }
     }
 
-    /// Lock a set of outpoints locally so the spend paths skip them.
+    /// Lock a set of outpoints locally so the spend paths skip them. Persists to disk;
+    /// a save failure is logged at warn level — the in-memory state is still updated.
     pub fn lock_outpoints(&mut self, outpoints: &[OutPoint]) {
         self.store
             .locked_outpoints
             .extend(outpoints.iter().copied());
+        if let Err(e) = self.save_to_disk() {
+            log::warn!("failed to persist lock_outpoints: {e:?}");
+        }
     }
 
     /// Return all locally-locked outpoints.
