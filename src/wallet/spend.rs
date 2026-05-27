@@ -37,6 +37,29 @@ pub enum Destination {
     MultiDynamic(Amount, Vec<Address>),
 }
 
+/// A representative scriptpubkey of the given address type, used purely for fee/dust
+/// estimation of a hypothetical change output. The hash bytes are zero — this is never
+/// signed, broadcast, or matched against the wallet.
+fn dummy_change_spk(address_type: AddressType) -> ScriptBuf {
+    use bitcoin::hashes::Hash;
+    use bitcoin::{PubkeyHash, WPubkeyHash, XOnlyPublicKey};
+    let _ = PubkeyHash::all_zeros; // make Hash trait usage explicit
+    match address_type {
+        AddressType::P2WPKH => ScriptBuf::new_p2wpkh(&WPubkeyHash::all_zeros()),
+        AddressType::P2TR => {
+            // Use the unspendable NUMS point for size — same wire shape as any other P2TR.
+            let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+            let xonly = XOnlyPublicKey::from_slice(&[
+                0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9,
+                0x7a, 0x5e, 0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a,
+                0xce, 0x80, 0x3a, 0xc0,
+            ])
+            .expect("static NUMS x-only is valid");
+            ScriptBuf::new_p2tr(&secp, xonly, None)
+        }
+    }
+}
+
 impl Wallet {
     /// API to perform spending from wallet UTXOs, including descriptor coins and swap coins.
     ///
@@ -317,16 +340,19 @@ impl Wallet {
                     };
                     tx.output.push(txout);
                 }
-                // Use specified change address type, default to P2WPKH
+                // Use specified change address type, default to P2WPKH.
+                // We *don't* reveal the change spk yet: it's only revealed if the change
+                // output is actually added (i.e. above dust). Otherwise revealing here
+                // would burn a fresh HD index every time change happens to fall below
+                // dust. Build a same-sized dummy spk for fee estimation only.
                 let change_type = change_address_type;
-                let internal_spk =
-                    self.get_next_internal_addresses(1, change_type)?[0].script_pubkey();
-                let minimal_nondust = internal_spk.minimal_non_dust();
+                let dummy_change_spk = dummy_change_spk(change_type);
+                let minimal_nondust = dummy_change_spk.minimal_non_dust();
 
                 let mut tx_wchange = tx.clone();
                 tx_wchange.output.push(TxOut {
                     value: Amount::ZERO, // Adjusted later
-                    script_pubkey: internal_spk.clone(),
+                    script_pubkey: dummy_change_spk,
                 });
 
                 let base_wchange = tx_wchange.base_size();
@@ -352,6 +378,9 @@ impl Wallet {
                     };
 
                 if remaining_wchange > minimal_nondust {
+                    // Now we know we'll add a change output; reveal the real internal spk.
+                    let internal_spk =
+                        self.get_next_internal_addresses(1, change_type)?[0].script_pubkey();
                     tx.output.push(TxOut {
                         script_pubkey: internal_spk,
                         value: remaining_wchange,
