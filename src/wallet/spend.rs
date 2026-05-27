@@ -37,25 +37,24 @@ pub enum Destination {
     MultiDynamic(Amount, Vec<Address>),
 }
 
-/// A representative scriptpubkey of the given address type, used purely for fee/dust
-/// estimation of a hypothetical change output. The hash bytes are zero — this is never
-/// signed, broadcast, or matched against the wallet.
+/// A placeholder scriptpubkey of the given address type, used purely for fee/dust
+/// estimation of a hypothetical change output. Same wire shape and same byte length
+/// as any real spk of the matching type — so `minimal_non_dust` and base-size weight
+/// match what the real output would produce — but never signed, broadcast, or matched
+/// against the wallet.
 fn dummy_change_spk(address_type: AddressType) -> ScriptBuf {
-    use bitcoin::{hashes::Hash, PubkeyHash, WPubkeyHash, XOnlyPublicKey};
-    let _ = PubkeyHash::all_zeros; // make Hash trait usage explicit
+    use bitcoin::{hashes::Hash, WPubkeyHash};
     match address_type {
+        // OP_0 + PUSH20 + 20 bytes = 22 bytes.
         AddressType::P2WPKH => ScriptBuf::new_p2wpkh(&WPubkeyHash::all_zeros()),
-        AddressType::P2TR => {
-            // Use the unspendable NUMS point for size — same wire shape as any other P2TR.
-            let secp = bitcoin::secp256k1::Secp256k1::verification_only();
-            let xonly = XOnlyPublicKey::from_slice(&[
-                0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9,
-                0x7a, 0x5e, 0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a,
-                0xce, 0x80, 0x3a, 0xc0,
-            ])
-            .expect("static NUMS x-only is valid");
-            ScriptBuf::new_p2tr(&secp, xonly, None)
-        }
+        // OP_1 + PUSH32 + 32 bytes = 34 bytes. The 32-byte payload is arbitrary; rust-
+        // bitcoin's dust + weight calculations key off the OP_1 PUSH32 shape, not the
+        // payload itself.
+        AddressType::P2TR => ScriptBuf::from_bytes(vec![
+            0x51, 0x20, // OP_1 PUSH32
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]),
     }
 }
 

@@ -135,46 +135,71 @@ impl Wallet {
 
     /// Returns a list of recent incoming transactions to the wallet (by default last 10).
     ///
-    /// A transaction is "incoming" if it has at least one output paying a script the wallet
-    /// owns (HD seed coin or swept-incoming swap coin). The list is sorted by confirmation
-    /// height descending (most recent first); `skip` and `count` paginate the result.
+    /// A transaction is "incoming" if any of its outputs pays a script the wallet
+    /// recognizes as an HD seed coin or a previously-swept incoming-swap coin. Walks the
+    /// full canonical tx history (including transactions whose outputs have since been
+    /// spent), sorted most-recent first.
     pub fn get_transactions(
         &self,
         count: Option<usize>,
         skip: Option<usize>,
     ) -> Result<Vec<IncomingTx>, WalletError> {
+        use bdk_chain::{CanonicalizationParams, ChainPosition};
+
         let count = count.unwrap_or(10);
         let skip = skip.unwrap_or(0);
 
-        // Group every (Utxo, UTXOSpendInfo) pair whose spend_info is a SeedCoin or
-        // SweptCoin by parent txid, and sum the value paid to our scripts.
-        use std::collections::BTreeMap;
-        let mut by_txid: BTreeMap<Txid, IncomingTx> = BTreeMap::new();
-        for (utxo, info) in self.list_all_utxo_spend_info() {
-            let is_incoming = matches!(
-                info,
-                super::api::UTXOSpendInfo::SeedCoin { .. }
-                    | super::api::UTXOSpendInfo::SweptCoin { .. }
-            );
-            if !is_incoming {
+        let tip = self.bdk.chain.tip();
+        let tip_height = tip.height();
+        let view = self.bdk.graph.canonical_view(
+            &self.bdk.chain,
+            tip.block_id(),
+            CanonicalizationParams::default(),
+        );
+
+        // Walk every canonical tx; keep any tx whose outputs pay one of our seed or swept
+        // spks, summing the value paid in.
+        let mut rows: Vec<(u32, IncomingTx)> = Vec::new();
+        for canonical_tx in view.txs() {
+            let mut owned_total = Amount::ZERO;
+            for txout in canonical_tx.tx.output.iter() {
+                let spk = &txout.script_pubkey;
+                let is_owned = self.bdk.keychain_of_spk(spk).is_some()
+                    || self.store.swept_incoming_swapcoins.contains(spk);
+                if is_owned {
+                    owned_total += txout.value;
+                }
+            }
+            if owned_total == Amount::ZERO {
                 continue;
             }
-            let entry = by_txid.entry(utxo.txid()).or_insert(IncomingTx {
-                txid: utxo.txid(),
-                amount: Amount::ZERO,
-                confirmations: utxo.confirmations,
-            });
-            entry.amount += utxo.amount;
-            // Take the lowest confirmations across all outputs of the tx.
-            if utxo.confirmations < entry.confirmations {
-                entry.confirmations = utxo.confirmations;
-            }
+
+            let (confirmations, sort_height) = match &canonical_tx.pos {
+                ChainPosition::Confirmed { anchor, .. } => {
+                    let h = anchor.block_id.height;
+                    (tip_height.saturating_sub(h) + 1, h)
+                }
+                // Unconfirmed → sort to the top (u32::MAX height-key).
+                ChainPosition::Unconfirmed { .. } => (0_u32, u32::MAX),
+            };
+            rows.push((
+                sort_height,
+                IncomingTx {
+                    txid: canonical_tx.txid,
+                    amount: owned_total,
+                    confirmations,
+                },
+            ));
         }
 
-        let mut rows: Vec<IncomingTx> = by_txid.into_values().collect();
-        // Most-recent (lowest confirmations) first.
-        rows.sort_by_key(|r| r.confirmations);
-        Ok(rows.into_iter().skip(skip).take(count).collect())
+        // Sort most-recent first (highest block height → top; unconfirmed first).
+        rows.sort_by_key(|(h, _)| std::cmp::Reverse(*h));
+        Ok(rows
+            .into_iter()
+            .map(|(_, tx)| tx)
+            .skip(skip)
+            .take(count)
+            .collect())
     }
 
     /// Sends specified Amount of Satoshis to an External Address

@@ -1521,12 +1521,13 @@ impl Wallet {
         Ok(address)
     }
 
-    /// Gets the next `count` internal addresses from the HD keychain.
+    /// Gets the next `count` internal addresses from the HD keychain. Saves the
+    /// wallet to disk after revealing.
     ///
     /// Each call reveals a fresh, never-issued index — back-to-back calls return
     /// distinct addresses even between syncs. The resulting `KeychainTxOutIndex`
-    /// `ChangeSet` is merged into the persisted store so the revealed counter
-    /// survives a reload (crash-safe).
+    /// `ChangeSet` is merged into the persisted store and flushed to disk so the
+    /// revealed counter survives a crash (parity with `get_next_external_address`).
     pub fn get_next_internal_addresses(
         &mut self,
         count: u32,
@@ -1553,6 +1554,7 @@ impl Wallet {
                 .map_err(|e| WalletError::General(format!("address from spk: {e}")))?;
             addresses.push(addr);
         }
+        self.save_to_disk()?;
         Ok(addresses)
     }
 
