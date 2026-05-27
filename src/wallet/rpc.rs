@@ -68,10 +68,22 @@ impl Wallet {
 
     /// Sync the wallet with the configured Bitcoin Core node via BDK's Emitter.
     fn sync(&mut self) -> Result<(), WalletError> {
-        // Resume sync from the BDK chain's tip; on a fresh wallet the tip is genesis so we
-        // fall back to wallet_birthday (or 0 if no birthday is known) to skip ahead.
+        // Pick the floor `start_height` for the Emitter's fallback (used only when it
+        // can't find an agreement point between our LocalChain and Core's chain).
+        //
+        // * Fresh wallet (LocalChain still at genesis): jump to `wallet_birthday` to
+        //   skip ahead — the wallet is by definition not interested in anything below
+        //   its birthday.
+        // * Otherwise: floor at 0. The Emitter's normal happy path starts emitting from
+        //   our tip+1 anyway, so 0 has no cost in the common case; it only matters when
+        //   a deep reorg invalidates blocks below wallet_birthday on the new chain,
+        //   which would otherwise leave those blocks permanently unscanned.
         let chain_tip_height = self.bdk.chain.tip().height();
-        let start_height = chain_tip_height.max(self.store.wallet_birthday.unwrap_or(0) as u32);
+        let start_height = if chain_tip_height == 0 {
+            self.store.wallet_birthday.unwrap_or(0) as u32
+        } else {
+            0
+        };
 
         let last_cp = self.bdk.chain.tip();
         let mut emitter = Emitter::new(&self.rpc, last_cp, start_height, NO_EXPECTED_MEMPOOL_TXS);
