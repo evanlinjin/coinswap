@@ -20,7 +20,7 @@ use std::{
 
 use super::swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin};
 
-use bitcoind::bitcoincore_rpc::bitcoincore_rpc_json::ListUnspentResultEntry;
+use super::api::Utxo;
 
 /// Address type supported by the wallet for HD address generation.
 #[derive(
@@ -64,7 +64,7 @@ pub(crate) struct WalletStore {
 
     /// Maps transaction outpoints to their associated UTXO and spend information.
     #[serde(default)] // Ensures deserialization works if `utxo_cache` is missing
-    pub(super) utxo_cache: HashMap<OutPoint, (ListUnspentResultEntry, UTXOSpendInfo)>,
+    pub(super) utxo_cache: HashMap<OutPoint, (Utxo, UTXOSpendInfo)>,
 
     /// Persisted BDK chain + indexed-tx-graph change sets driving wallet sync.
     #[serde(default)]

@@ -1,12 +1,11 @@
 use super::Wallet;
-use crate::wallet::api::UTXOSpendInfo;
+use crate::wallet::api::{UTXOSpendInfo, Utxo};
 use bip39::rand::{thread_rng, Rng};
 use bitcoin::Amount;
-use bitcoind::bitcoincore_rpc::json::ListUnspentResultEntry;
 
 // Used for calculating fee optimization scores
 struct FeeOptimizationResult {
-    input: Vec<(ListUnspentResultEntry, UTXOSpendInfo)>,
+    input: Vec<(Utxo, UTXOSpendInfo)>,
     target_chunks: Vec<u64>,
     change_chunks: Vec<u64>,
     score: f64,
@@ -24,7 +23,7 @@ impl Wallet {
     /// Performs simple fee optimization based on the number of selected inputs and target chunks, change chunks
     fn simple_fee_optimization(
         &self,
-        selected_inputs: Vec<(ListUnspentResultEntry, UTXOSpendInfo)>,
+        selected_inputs: Vec<(Utxo, UTXOSpendInfo)>,
         target_chunks: Vec<u64>,
         change_chunks: Vec<u64>,
     ) -> f64 {
@@ -190,14 +189,10 @@ impl Wallet {
     /// It never creates a signature i.e a tiny change/target utxo, as that would be a privacy leak.
     pub fn create_dynamic_splits(
         &mut self,
-        inital_selected_inputs: Vec<(ListUnspentResultEntry, UTXOSpendInfo)>,
+        inital_selected_inputs: Vec<(Utxo, UTXOSpendInfo)>,
         target: u64,
         fee_rate: f64,
-    ) -> (
-        Vec<(ListUnspentResultEntry, UTXOSpendInfo)>,
-        Vec<u64>,
-        Vec<u64>,
-    ) {
+    ) -> (Vec<(Utxo, UTXOSpendInfo)>, Vec<u64>, Vec<u64>) {
         // 1. Select initial UTXOs
         let selected_inputs = inital_selected_inputs;
 
@@ -287,7 +282,7 @@ impl Wallet {
             //     } else {
             //         let outpoints = delta_inputs
             //             .iter()
-            //             .map(|(unspent, _)| OutPoint::new(unspent.txid, unspent.vout))
+            //             .map(|(unspent, _)| OutPoint::new(unspent.txid(), unspent.vout()))
             //             .collect::<Vec<_>>();
             //         if let Err(e) = self.rpc.unlock_unspent(&outpoints) {
             //             log::info!("Failed to unlock unspent outputs: {e:?}");
@@ -315,7 +310,7 @@ impl Wallet {
             // Lock the outpoints here
             let outpoints = delta_inputs
                 .iter()
-                .map(|(unspent, _)| bitcoin::OutPoint::new(unspent.txid, unspent.vout))
+                .map(|(unspent, _)| bitcoin::OutPoint::new(unspent.txid(), unspent.vout()))
                 .collect::<Vec<_>>();
 
             self.lock_outpoints(&outpoints);

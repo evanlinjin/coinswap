@@ -8,7 +8,9 @@ use bitcoin::{
     absolute::LockTime, script::PushBytesBuf, transaction::Version, Address, Amount, OutPoint,
     ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
-use bitcoind::bitcoincore_rpc::{json::ListUnspentResultEntry, RpcApi};
+use bitcoind::bitcoincore_rpc::RpcApi;
+
+use super::api::Utxo;
 
 use crate::{
     utill::calculate_fee_sats,
@@ -56,11 +58,11 @@ impl Wallet {
         &mut self,
         feerate: f64,
         destination: Destination,
-        coins_to_spend: &[(ListUnspentResultEntry, UTXOSpendInfo)],
+        coins_to_spend: &[(Utxo, UTXOSpendInfo)],
     ) -> Result<Transaction, WalletError> {
         log::info!("Creating Direct-Spend from Wallet.");
 
-        let mut coins = Vec::<(ListUnspentResultEntry, UTXOSpendInfo)>::new();
+        let mut coins = Vec::<(Utxo, UTXOSpendInfo)>::new();
 
         for coin in coins_to_spend {
             // filter all contract and fidelity utxos.
@@ -161,7 +163,7 @@ impl Wallet {
     #[hotpath::measure]
     pub fn spend_coins(
         &mut self,
-        coins: &[(ListUnspentResultEntry, UTXOSpendInfo)],
+        coins: &[(Utxo, UTXOSpendInfo)],
         destination: Destination,
         feerate: f64,
     ) -> Result<Transaction, WalletError> {
@@ -184,7 +186,7 @@ impl Wallet {
             match spend_info {
                 UTXOSpendInfo::SeedCoin { .. } | UTXOSpendInfo::SweptCoin { .. } => {
                     tx.input.push(TxIn {
-                        previous_output: OutPoint::new(utxo_data.txid, utxo_data.vout),
+                        previous_output: OutPoint::new(utxo_data.txid(), utxo_data.vout()),
                         sequence: Sequence::ZERO,
                         witness: Witness::new(),
                         script_sig: ScriptBuf::new(),
@@ -194,7 +196,7 @@ impl Wallet {
                 }
                 UTXOSpendInfo::IncomingSwapCoin { .. } | UTXOSpendInfo::OutgoingSwapCoin { .. } => {
                     tx.input.push(TxIn {
-                        previous_output: OutPoint::new(utxo_data.txid, utxo_data.vout),
+                        previous_output: OutPoint::new(utxo_data.txid(), utxo_data.vout()),
                         sequence: Sequence::ZERO,
                         witness: Witness::new(),
                         script_sig: ScriptBuf::new(),
@@ -392,7 +394,7 @@ impl Wallet {
 
                     for (utxo, _) in new_utxos {
                         tx.input.push(TxIn {
-                            previous_output: OutPoint::new(utxo.txid, utxo.vout),
+                            previous_output: OutPoint::new(utxo.txid(), utxo.vout()),
                             sequence: Sequence::ZERO,
                             witness: Witness::new(),
                             script_sig: ScriptBuf::new(),

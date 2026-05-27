@@ -102,8 +102,8 @@ fn test_create_funding_txn_with_varied_distributions() {
                     .list_all_utxo_spend_info()
                     .iter()
                     .find(|(utxo, _)| {
-                        txin.previous_output.txid == utxo.txid
-                            && txin.previous_output.vout == utxo.vout
+                        txin.previous_output.txid == utxo.txid()
+                            && txin.previous_output.vout == utxo.vout()
                     })
                     .map(|(u, _)| u.amount)
                     .expect("should find utxo")

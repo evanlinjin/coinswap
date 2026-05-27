@@ -155,7 +155,7 @@ impl Wallet {
 
             let outpoints: Vec<OutPoint> = selected_utxo
                 .iter()
-                .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+                .map(|(utxo, _)| OutPoint::new(utxo.txid(), utxo.vout()))
                 .collect();
 
             // // Lock the selected UTXOs immediately after selection
@@ -240,7 +240,7 @@ impl Wallet {
 
                 let outpoints: Vec<OutPoint> = selected_utxo
                     .iter()
-                    .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+                    .map(|(utxo, _)| OutPoint::new(utxo.txid(), utxo.vout()))
                     .collect();
                 // Flow of Lock Step 3. Lock the selected UTXOs immediately after selection
                 self.lock_outpoints(&outpoints);

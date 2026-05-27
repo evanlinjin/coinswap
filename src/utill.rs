@@ -1,12 +1,12 @@
 //! Various utility and helper functions for both Taker and Maker.
 
+use crate::wallet::Utxo;
 use bitcoin::{
     hashes::Hash,
     key::{rand::thread_rng, Keypair},
     secp256k1::{Secp256k1, SecretKey},
     Address, Amount, FeeRate, Network, PublicKey, ScriptBuf, WitnessProgram, WitnessVersion,
 };
-use bitcoind::bitcoincore_rpc::json::ListUnspentResultEntry;
 use crossterm::{
     cursor::MoveTo,
     event::{
@@ -274,39 +274,6 @@ pub(crate) fn generate_maker_keys(
     ))
 }
 
-/// Extracts hierarchical deterministic (HD) path components from a descriptor.
-///
-/// Parses an input descriptor string and returns `Some` with a tuple containing the HD path
-/// components if it's an HD descriptor. If the descriptor doesn't have path info, it returns `None`.
-/// This method only works for single key descriptors.
-pub(crate) fn get_hd_path_from_descriptor(descriptor: &str) -> Option<(&str, u32, i32)> {
-    let open = descriptor.find('[');
-    let close = descriptor.find(']');
-
-    let path = if let (Some(open), Some(close)) = (open, close) {
-        &descriptor[open + 1..close]
-    } else {
-        // Debug log, because if it doesn't have path, its not an error.
-        log::error!("Descriptor doesn't have path = {descriptor}");
-        return None;
-    };
-
-    let path_chunks: Vec<&str> = path.split('/').collect();
-    if path_chunks.len() != 3 {
-        // Debug log, because if it doesn't have path, its not an error.
-        //log::warn!("Path is not a triplet. Path chunks = {:?}", path_chunks);
-        return None;
-    }
-
-    if let (Ok(addr_type), Ok(index)) =
-        (path_chunks[1].parse::<u32>(), path_chunks[2].parse::<i32>())
-    {
-        Some((path_chunks[0], addr_type, index))
-    } else {
-        None
-    }
-}
-
 /// Generates a keypair using the secp256k1 elliptic curve.
 pub(crate) fn generate_keypair() -> (PublicKey, SecretKey) {
     let keypair = Keypair::new(&Secp256k1::new(), &mut thread_rng());
@@ -383,7 +350,7 @@ pub struct UTXO {
 
 impl UTXO {
     /// Creates an UTXO from detailed internal utxo data
-    pub fn from_utxo_data(data: (ListUnspentResultEntry, UTXOSpendInfo)) -> Self {
+    pub fn from_utxo_data(data: (Utxo, UTXOSpendInfo)) -> Self {
         let (entry, spend_info) = data;
         let addr = entry
             .address
@@ -745,9 +712,9 @@ where
 
 /// Interactive Selection by User for Utxos
 pub fn interactive_select(
-    mut choices: Vec<(ListUnspentResultEntry, UTXOSpendInfo)>,
+    mut choices: Vec<(Utxo, UTXOSpendInfo)>,
     required_amount: Amount,
-) -> Result<Vec<(ListUnspentResultEntry, UTXOSpendInfo)>, WalletError> {
+) -> Result<Vec<(Utxo, UTXOSpendInfo)>, WalletError> {
     if choices.is_empty() {
         return Err(WalletError::General("No UTXOs available".to_string()));
     }
@@ -810,7 +777,7 @@ pub fn interactive_select(
     // Render only a singular UTXO box (for selection updates)
     // Once this box has been rendered, we will only update those grids triggered by keyboard clicks
     let render_utxo_grid = |stdout: &mut io::Stdout,
-                            choices: &[(ListUnspentResultEntry, UTXOSpendInfo)],
+                            choices: &[(Utxo, UTXOSpendInfo)],
                             selected: &[bool],
                             scroll_offset: usize|
      -> Result<(), WalletError> {
@@ -957,7 +924,7 @@ pub fn interactive_select(
 
     println!("Selected UTXOs:");
     for utxo in selected_utxo.iter() {
-        println!("  - {} BTC ({})", utxo.0.amount.to_btc(), utxo.0.txid);
+        println!("  - {} BTC ({})", utxo.0.amount.to_btc(), utxo.0.txid());
     }
 
     let total_selected: Amount = selected_utxo.iter().map(|(u, _)| u.amount).sum();
@@ -1070,48 +1037,6 @@ mod tests {
             "0020b5954ef36e6bd532c7e90f41927a3556b0fef6416695dbe50ff40c6a55a6232c"
         );
     }
-    #[test]
-    fn test_hd_path_from_descriptor() {
-        assert_eq!(
-            get_hd_path_from_descriptor(
-                "wpkh([a945b5ca/1/1]020b77637989868dcd502dbc07d6304dc2150301693ae84a60b379c3b696b289ad)#aq759em9"
-            ),
-            Some(("a945b5ca", 1, 1))
-        );
-    }
-    #[test]
-    fn test_hd_path_from_descriptor_gets_none() {
-        assert_eq!(
-            get_hd_path_from_descriptor(
-                "wsh(multi(2,[f67b69a3]0245ddf535f08a04fd86d794b76f8e3949f27f7ae039b641bf277c6a4552b4c387,[dbcd3c6e]030f781e9d2a6d3a823cee56be2d062ed4269f5a6294b20cb8817eb540c641d9a2))#8f70vn2q"
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn test_hd_path_from_descriptor_failure_cases() {
-        let test_cases = [
-            (
-                "wpkh a945b5ca/1/1 029b77637989868dcd502dbc07d6304dc2150301693ae84a60b379c3b696b289ad aq759em9",
-                None,
-            ), // without brackets
-            (
-                "wpkh([a945b5ca/invalid/1]029b77637989868dcd502dbc07d6304dc2150301693ae84a60b379c3b696b289ad)#aq759em9",
-                None,
-            ), // invalid address type
-            (
-                "wpkh([a945b5ca/1/invalid]029b77637989868dcd502dbc07d6304dc2150301693ae84a60b379c3b696b289ad)#aq759em9",
-                None,
-            ), // invalid index
-        ];
-
-        for (descriptor, expected_output) in test_cases.iter() {
-            let result = get_hd_path_from_descriptor(descriptor);
-            assert_eq!(result, *expected_output);
-        }
-    }
-
     #[test]
     fn test_generate_maker_keys() {
         // generate_maker_keys: test that given a tweakable_point the return values satisfy the equation:

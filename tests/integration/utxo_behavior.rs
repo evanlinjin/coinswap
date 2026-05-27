@@ -483,7 +483,7 @@ fn test_manual_coinselection() {
             all_utxos
                 .iter()
                 .find(|utxo| utxo.amount.to_sat() == target_amount)
-                .map(|utxo| OutPoint::new(utxo.txid, utxo.vout))
+                .map(|utxo| OutPoint::new(utxo.txid(), utxo.vout()))
         })
         .collect();
 
@@ -533,7 +533,7 @@ fn test_manual_coinselection() {
         .unwrap()
         .list_all_utxo()
         .iter()
-        .map(|utxo| OutPoint::new(utxo.txid, utxo.vout))
+        .map(|utxo| OutPoint::new(utxo.txid(), utxo.vout()))
         .collect();
 
     let manual_utxos_spent = manually_selected_utxos
@@ -664,14 +664,14 @@ fn test_manual_coinselection() {
             "R" => {
                 let regular_outpoints: Vec<OutPoint> = regular_utxos
                     .iter()
-                    .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+                    .map(|(utxo, _)| OutPoint::new(utxo.txid(), utxo.vout()))
                     .collect();
                 Some(regular_outpoints)
             }
             "S" => {
                 let swap_outpoints: Vec<OutPoint> = swept_utxos
                     .iter()
-                    .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+                    .map(|(utxo, _)| OutPoint::new(utxo.txid(), utxo.vout()))
                     .collect();
                 Some(swap_outpoints)
             }
@@ -679,11 +679,11 @@ fn test_manual_coinselection() {
                 let mixed_outpoints: Vec<OutPoint> = vec![
                     regular_utxos
                         .first()
-                        .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+                        .map(|(utxo, _)| OutPoint::new(utxo.txid(), utxo.vout()))
                         .unwrap(),
                     swept_utxos
                         .first()
-                        .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+                        .map(|(utxo, _)| OutPoint::new(utxo.txid(), utxo.vout()))
                         .unwrap(),
                 ];
                 Some(mixed_outpoints)

@@ -349,13 +349,13 @@ fn test_fidelity_spending() {
 
         log::info!(
             "Found fidelity bond UTXO: txid={}, vout={}, amount={} sats",
-            fidelity_utxo.txid,
-            fidelity_utxo.vout,
+            fidelity_utxo.txid(),
+            fidelity_utxo.vout(),
             fidelity_utxo.amount.to_sat()
         );
         log::info!("Total UTXOs in wallet: {}", all_utxos.len());
 
-        (fidelity_utxo.txid, fidelity_utxo.vout, fidelity_utxo.amount)
+        (fidelity_utxo.txid(), fidelity_utxo.vout(), fidelity_utxo.amount)
     };
 
     let check_fidelity_utxo_integrity = |iteration: usize| {
@@ -363,8 +363,8 @@ fn test_fidelity_spending() {
         let all_utxos = wallet.list_all_utxo();
 
         let fidelity_utxo_still_exists = all_utxos.iter().any(|utxo| {
-            utxo.txid == fidelity_utxo_info.0
-                && utxo.vout == fidelity_utxo_info.1
+            utxo.txid() == fidelity_utxo_info.0
+                && utxo.vout() == fidelity_utxo_info.1
                 && utxo.amount == fidelity_utxo_info.2
         });
 
@@ -475,8 +475,8 @@ fn test_fidelity_spending() {
         let all_utxos = wallet.list_all_utxo();
 
         let fidelity_utxo_still_exists = all_utxos.iter().any(|utxo| {
-            utxo.txid == fidelity_utxo_info.0
-                && utxo.vout == fidelity_utxo_info.1
+            utxo.txid() == fidelity_utxo_info.0
+                && utxo.vout() == fidelity_utxo_info.1
                 && utxo.amount == fidelity_utxo_info.2
         });
 
