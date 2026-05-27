@@ -41,8 +41,7 @@ pub enum Destination {
 /// estimation of a hypothetical change output. The hash bytes are zero — this is never
 /// signed, broadcast, or matched against the wallet.
 fn dummy_change_spk(address_type: AddressType) -> ScriptBuf {
-    use bitcoin::hashes::Hash;
-    use bitcoin::{PubkeyHash, WPubkeyHash, XOnlyPublicKey};
+    use bitcoin::{hashes::Hash, PubkeyHash, WPubkeyHash, XOnlyPublicKey};
     let _ = PubkeyHash::all_zeros; // make Hash trait usage explicit
     match address_type {
         AddressType::P2WPKH => ScriptBuf::new_p2wpkh(&WPubkeyHash::all_zeros()),

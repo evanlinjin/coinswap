@@ -516,46 +516,57 @@ impl Wallet {
     }
 
     /// Finds a outgoing swap coin by multisig redeemscript.
+    /// Find a Legacy outgoing swapcoin whose 2-of-2 multisig redeem script equals
+    /// `multisig_redeemscript`. Used by the UTXO classifier to recognize wsh-multisig
+    /// outputs that BDK's `SpkTxOutIndex` matched as `WatchKey::Swap`.
+    ///
+    /// Taproot swapcoins are intentionally skipped: their funding output is a P2TR
+    /// MuSig2 aggregate (not a wsh-sortedmulti), and they are not registered with
+    /// BDK as `WatchKey::Swap` — they are tracked via the contract_tx stored in
+    /// `outgoing_swapcoins` and verified via direct `get_tx_out` lookups.
     pub(crate) fn find_outgoing_swapcoin_by_multisig(
         &self,
         multisig_redeemscript: &ScriptBuf,
     ) -> Option<&super::swapcoin::OutgoingSwapCoin> {
         for swapcoin in self.store.outgoing_swapcoins.values() {
-            // Only check Legacy swapcoins which have my_pubkey and other_pubkey
-            if swapcoin.protocol == crate::protocol::ProtocolVersion::Legacy {
-                if let (Some(my_pubkey), Some(other_pubkey)) =
-                    (swapcoin.my_pubkey, swapcoin.other_pubkey)
-                {
-                    let computed_script = crate::protocol::contract::create_multisig_redeemscript(
-                        &my_pubkey,
-                        &other_pubkey,
-                    );
-                    if &computed_script == multisig_redeemscript {
-                        return Some(swapcoin);
-                    }
+            if swapcoin.protocol != crate::protocol::ProtocolVersion::Legacy {
+                continue;
+            }
+            if let (Some(my_pubkey), Some(other_pubkey)) =
+                (swapcoin.my_pubkey, swapcoin.other_pubkey)
+            {
+                let computed_script = crate::protocol::contract::create_multisig_redeemscript(
+                    &my_pubkey,
+                    &other_pubkey,
+                );
+                if &computed_script == multisig_redeemscript {
+                    return Some(swapcoin);
                 }
             }
         }
         None
     }
 
-    /// Finds a incoming swap coin by multisig redeemscript.
+    /// Find a Legacy incoming swapcoin whose 2-of-2 multisig redeem script equals
+    /// `multisig_redeemscript`. See [`Self::find_outgoing_swapcoin_by_multisig`] for
+    /// the Taproot rationale.
     pub(crate) fn find_incoming_swapcoin_by_multisig(
         &self,
         multisig_redeemscript: &ScriptBuf,
     ) -> Option<&super::swapcoin::IncomingSwapCoin> {
         for swapcoin in self.store.incoming_swapcoins.values() {
-            if swapcoin.protocol == crate::protocol::ProtocolVersion::Legacy {
-                if let (Some(my_pubkey), Some(other_pubkey)) =
-                    (swapcoin.my_pubkey, swapcoin.other_pubkey)
-                {
-                    let computed_script = crate::protocol::contract::create_multisig_redeemscript(
-                        &my_pubkey,
-                        &other_pubkey,
-                    );
-                    if &computed_script == multisig_redeemscript {
-                        return Some(swapcoin);
-                    }
+            if swapcoin.protocol != crate::protocol::ProtocolVersion::Legacy {
+                continue;
+            }
+            if let (Some(my_pubkey), Some(other_pubkey)) =
+                (swapcoin.my_pubkey, swapcoin.other_pubkey)
+            {
+                let computed_script = crate::protocol::contract::create_multisig_redeemscript(
+                    &my_pubkey,
+                    &other_pubkey,
+                );
+                if &computed_script == multisig_redeemscript {
+                    return Some(swapcoin);
                 }
             }
         }
