@@ -74,22 +74,13 @@ impl Wallet {
         // external addresses. (Internal scripts are revealed on-demand by the spend path.)
         self.ensure_revealed_to_external_index()?;
 
-        // Pick the starting height. If `last_synced_height` is set we resume from there;
-        // otherwise we start from the wallet birthday (or 0 if neither is known).
-        let start_height = self
-            .store
-            .last_synced_height
-            .or(self.store.wallet_birthday)
-            .unwrap_or(0) as u32;
+        // Resume sync from the BDK chain's tip; on a fresh wallet the tip is genesis so we
+        // fall back to wallet_birthday (or 0 if no birthday is known) to skip ahead.
+        let chain_tip_height = self.bdk.chain.tip().height();
+        let start_height = chain_tip_height.max(self.store.wallet_birthday.unwrap_or(0) as u32);
 
         let last_cp = self.bdk.chain.tip();
         let mut emitter = Emitter::new(&self.rpc, last_cp, start_height, NO_EXPECTED_MEMPOOL_TXS);
-
-        let mut tip_height: u32 = self
-            .store
-            .last_synced_height
-            .unwrap_or(0)
-            .min(u32::MAX as u64) as u32;
 
         let mut blocks_since_persist: u32 = 0;
 
@@ -111,11 +102,9 @@ impl Wallet {
             self.store.bdk.local_chain.merge(chain_cs);
             self.store.bdk.indexed_tx_graph.merge(graph_cs);
 
-            tip_height = height;
             blocks_since_persist += 1;
 
             if blocks_since_persist >= PERSIST_EVERY_N_BLOCKS {
-                self.store.last_synced_height = Some(tip_height as u64);
                 self.save_to_disk()?;
                 blocks_since_persist = 0;
             }
@@ -130,8 +119,6 @@ impl Wallet {
                 .batch_insert_relevant_unconfirmed(mempool.update);
             self.store.bdk.indexed_tx_graph.merge(mempool_cs);
         }
-
-        self.store.last_synced_height = Some(tip_height as u64);
 
         // Refresh the legacy `utxo_cache` shim so existing call sites see up-to-date UTXOs.
         self.refresh_utxo_cache_from_bdk()?;

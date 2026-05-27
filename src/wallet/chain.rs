@@ -33,12 +33,30 @@ use bitcoin::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::wallet::{api::KeychainKind, error::WalletError, storage::AddressType};
+use crate::wallet::{error::WalletError, storage::AddressType};
+
+/// One of the two unhardened branches off the BIP-84/86 account path.
+/// `External` (branch 0) is for receive addresses, `Internal` (branch 1) for change.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy, Serialize, Deserialize)]
+pub(crate) enum KeychainKind {
+    External = 0,
+    Internal = 1,
+}
 
 /// Number of lookahead spks per HD keychain. Higher = more memory but safer against
 /// missed-payment situations when the wallet receives bursts of payments past the
 /// last revealed index.
 pub(crate) const KEYCHAIN_LOOKAHEAD: u32 = 100;
+
+/// Account-level hardened derivation path for the given address type.
+/// Single source of truth — both [`SeedKeychain::account_path`] and the seed-coin
+/// signing code in `api.rs` route through this.
+pub(crate) fn account_path(address_type: AddressType) -> &'static str {
+    match address_type {
+        AddressType::P2WPKH => "m/84'/1'/0'",
+        AddressType::P2TR => "m/86'/1'/0'",
+    }
+}
 
 /// Identifies one of the four HD seed keychains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -71,18 +89,12 @@ impl SeedKeychain {
 
     /// Account-level hardened derivation path (e.g. `m/84'/1'/0'`).
     pub(crate) fn account_path(self) -> &'static str {
-        match self.address_type {
-            AddressType::P2WPKH => "m/84'/1'/0'",
-            AddressType::P2TR => "m/86'/1'/0'",
-        }
+        account_path(self.address_type)
     }
 
     /// Branch index (0 = external, 1 = internal).
     pub(crate) fn branch_index(self) -> u32 {
-        match self.kind {
-            KeychainKind::External => 0,
-            KeychainKind::Internal => 1,
-        }
+        self.kind as u32
     }
 
     /// Build the wildcard public descriptor for this keychain from the wallet master xpriv.

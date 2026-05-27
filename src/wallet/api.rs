@@ -46,11 +46,6 @@ use super::{
 // data in the bitcoin core wallet
 // for example which privkey corresponds to a scriptpubkey is stored in hd paths
 
-/// BIP-84 derivation path for P2WPKH (Native SegWit)
-const HARDENDED_DERIVATION_P2WPKH: &str = "m/84'/1'/0'";
-/// BIP-86 derivation path for P2TR (Taproot key-path)
-const HARDENDED_DERIVATION_P2TR: &str = "m/86'/1'/0'";
-
 /// Represents a Bitcoin wallet with associated functionality and data.
 pub struct Wallet {
     pub(crate) rpc: Client,
@@ -105,28 +100,12 @@ impl PartialEq for Wallet {
         //avoided outgoing_swapcoins
         //avoided prevout_to_contract_map
         self.store.fidelity_bond == other.store.fidelity_bond &&
-        //avoided last_synced_height
         self.store.wallet_birthday == other.store.wallet_birthday &&
         self.store.utxo_cache == other.store.utxo_cache
     }
 }
 
-/// Specify the keychain derivation path from [`HARDENDED_DERIVATION_P2WPKH`] or [`HARDENDED_DERIVATION_P2TR`]
-/// Each kind represents an unhardened index value. Starting with External = 0.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy, Serialize, Deserialize)]
-pub(crate) enum KeychainKind {
-    External = 0isize,
-    Internal,
-}
-
-impl KeychainKind {
-    fn index_num(&self) -> u32 {
-        match self {
-            Self::External => 0,
-            Self::Internal => 1,
-        }
-    }
-}
+pub(crate) use super::chain::KeychainKind;
 
 /// Enum representing additional data needed to spend a UTXO, in addition to `ListUnspentResultEntry`.
 // data needed to find information  in addition to ListUnspentResultEntry
@@ -354,16 +333,7 @@ impl Wallet {
             Some(wallet_birthday),
             &store_enc_material,
         )?;
-        let last_synced_height_val = match store.last_synced_height {
-            Some(height) => height.to_string(),
-            None => "None".to_string(),
-        };
-
-        log::info!(
-            "Wallet birth_height = {}, wallet last_sync_height = {}",
-            wallet_birthday,
-            last_synced_height_val
-        );
+        log::info!("Wallet birth_height = {wallet_birthday}");
 
         let bdk = Self::build_bdk_chain(&store)?;
         Ok(Self {
@@ -1103,10 +1073,7 @@ impl Wallet {
 
     /// Returns the derivation path for the given address type
     fn get_derivation_path(address_type: AddressType) -> &'static str {
-        match address_type {
-            AddressType::P2WPKH => HARDENDED_DERIVATION_P2WPKH,
-            AddressType::P2TR => HARDENDED_DERIVATION_P2TR,
-        }
+        super::chain::account_path(address_type)
     }
 
     /// Gets the external index from the wallet.
@@ -1598,7 +1565,7 @@ impl Wallet {
         let mut witness_script: Option<ScriptBuf> = None;
 
         if let Some((kc, idx)) = self.bdk.keychain_of_spk(&full_txo.txout.script_pubkey) {
-            descriptor = Some(self.synth_descriptor_for(kc.address_type, kc.kind.index_num(), idx));
+            descriptor = Some(self.synth_descriptor_for(kc.address_type, kc.branch_index(), idx));
         } else {
             // Not an HD spk — check watch keys for swap multisigs (where we can attach
             // the witness_script). Other watch keys (contracts, fidelity, sweep) don't
@@ -1803,10 +1770,7 @@ impl Wallet {
                     address_type,
                     ..
                 } => {
-                    let base_derivation = match address_type {
-                        AddressType::P2WPKH => HARDENDED_DERIVATION_P2WPKH,
-                        AddressType::P2TR => HARDENDED_DERIVATION_P2TR,
-                    };
+                    let base_derivation = super::chain::account_path(*address_type);
                     let master_private_key = self
                         .store
                         .master_key
@@ -1889,10 +1853,7 @@ impl Wallet {
                     address_type,
                     ..
                 } => {
-                    let base_derivation = match address_type {
-                        AddressType::P2WPKH => HARDENDED_DERIVATION_P2WPKH,
-                        AddressType::P2TR => HARDENDED_DERIVATION_P2TR,
-                    };
+                    let base_derivation = super::chain::account_path(address_type);
                     let master_private_key = self
                         .store
                         .master_key
