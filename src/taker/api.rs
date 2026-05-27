@@ -26,7 +26,9 @@ use bitcoin::{
     },
     Amount, OutPoint, PublicKey,
 };
-use bitcoind::bitcoincore_rpc::{json::ListUnspentResultEntry, RpcApi};
+use bitcoind::bitcoincore_rpc::RpcApi;
+
+use crate::wallet::Utxo;
 use socks::Socks5Stream;
 
 use crate::{
@@ -2006,7 +2008,7 @@ impl Taker {
     /// Prints the report to console and saves a JSON file to `{data_dir}/swap_reports/`.
     fn generate_swap_report(
         &self,
-        initial_utxos: &[ListUnspentResultEntry],
+        initial_utxos: &[Utxo],
         start_time: Instant,
         status: SwapStatus,
         error_message: Option<String>,
@@ -2022,16 +2024,16 @@ impl Taker {
         let initial_outpoints: HashSet<OutPoint> = initial_utxos
             .iter()
             .map(|utxo| OutPoint {
-                txid: utxo.txid,
-                vout: utxo.vout,
+                txid: utxo.txid(),
+                vout: utxo.vout(),
             })
             .collect();
 
         let current_outpoints: HashSet<OutPoint> = all_regular_utxo
             .iter()
             .map(|(utxo, _)| OutPoint {
-                txid: utxo.txid,
-                vout: utxo.vout,
+                txid: utxo.txid(),
+                vout: utxo.vout(),
             })
             .collect();
 
@@ -2040,20 +2042,20 @@ impl Taker {
             .iter()
             .filter(|utxo| {
                 !current_outpoints.contains(&OutPoint {
-                    txid: utxo.txid,
-                    vout: utxo.vout,
+                    txid: utxo.txid(),
+                    vout: utxo.vout(),
                 })
             })
             .map(|utxo| utxo.amount.to_sat())
             .collect();
 
         // New regular UTXOs created (present now, absent initially)
-        let output_regular_utxos: Vec<&(ListUnspentResultEntry, _)> = all_regular_utxo
+        let output_regular_utxos: Vec<&(Utxo, _)> = all_regular_utxo
             .iter()
             .filter(|(utxo, _)| {
                 !initial_outpoints.contains(&OutPoint {
-                    txid: utxo.txid,
-                    vout: utxo.vout,
+                    txid: utxo.txid(),
+                    vout: utxo.vout(),
                 })
             })
             .collect();
@@ -2244,12 +2246,7 @@ impl Taker {
     }
 
     /// Emit a failure report for the current swap (best-effort, does not propagate errors).
-    fn emit_failure_report(
-        &self,
-        initial_utxos: &[ListUnspentResultEntry],
-        start_time: Instant,
-        error: &TakerError,
-    ) {
+    fn emit_failure_report(&self, initial_utxos: &[Utxo], start_time: Instant, error: &TakerError) {
         if let Err(e) = self.generate_swap_report(
             initial_utxos,
             start_time,

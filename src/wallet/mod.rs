@@ -2,6 +2,7 @@
 
 mod api;
 mod backup;
+pub(crate) mod chain;
 mod error;
 pub mod ffi;
 mod fidelity;
@@ -13,7 +14,7 @@ mod split_utxos;
 mod storage;
 pub(crate) mod swapcoin;
 
-pub use api::{Balances, RecoveryOutcome, UTXOSpendInfo, Wallet};
+pub use api::{Balances, RecoveryOutcome, UTXOSpendInfo, Utxo, Wallet};
 pub use backup::WalletBackup;
 pub use error::WalletError;
 pub use fidelity::FidelityBond;

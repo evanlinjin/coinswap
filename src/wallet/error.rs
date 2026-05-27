@@ -93,11 +93,6 @@ pub enum WalletError {
         required: u64,
     },
 
-    /// Represents an error from the rust-coinselect library.
-    ///
-    /// Typically occurs during fee calculation or coin selection operations.
-    Selection(rust_coinselect::types::SelectionError),
-
     /// Represents an error caused by an invalid Bitcoin address
     ///
     /// wraps the internal [`bitcoin::address::ParseError`] directly so callers
@@ -197,12 +192,6 @@ impl From<bitcoin::consensus::encode::Error> for WalletError {
     }
 }
 
-impl From<rust_coinselect::types::SelectionError> for WalletError {
-    fn from(value: rust_coinselect::types::SelectionError) -> Self {
-        Self::Selection(value)
-    }
-}
-
 impl From<bitcoin::address::ParseError> for WalletError {
     fn from(value: bitcoin::address::ParseError) -> Self {
         Self::InvalidAddress(value)
@@ -242,7 +231,6 @@ impl std::fmt::Display for WalletError {
                     available, required
                 )
             }
-            WalletError::Selection(e) => write!(f, "Coin selection error: {:?}", e),
             WalletError::InvalidAddress(e) => write!(f, "Invalid Bitcoin address: {}", e),
         }
     }

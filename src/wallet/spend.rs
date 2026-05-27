@@ -8,7 +8,9 @@ use bitcoin::{
     absolute::LockTime, script::PushBytesBuf, transaction::Version, Address, Amount, OutPoint,
     ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
-use bitcoind::bitcoincore_rpc::{json::ListUnspentResultEntry, RpcApi};
+use bitcoind::bitcoincore_rpc::RpcApi;
+
+use super::api::Utxo;
 
 use crate::{
     utill::calculate_fee_sats,
@@ -35,6 +37,27 @@ pub enum Destination {
     MultiDynamic(Amount, Vec<Address>),
 }
 
+/// A placeholder scriptpubkey of the given address type, used purely for fee/dust
+/// estimation of a hypothetical change output. Same wire shape and same byte length
+/// as any real spk of the matching type — so `minimal_non_dust` and base-size weight
+/// match what the real output would produce — but never signed, broadcast, or matched
+/// against the wallet.
+fn dummy_change_spk(address_type: AddressType) -> ScriptBuf {
+    use bitcoin::{hashes::Hash, WPubkeyHash};
+    match address_type {
+        // OP_0 + PUSH20 + 20 bytes = 22 bytes.
+        AddressType::P2WPKH => ScriptBuf::new_p2wpkh(&WPubkeyHash::all_zeros()),
+        // OP_1 + PUSH32 + 32 bytes = 34 bytes. The 32-byte payload is arbitrary; rust-
+        // bitcoin's dust + weight calculations key off the OP_1 PUSH32 shape, not the
+        // payload itself.
+        AddressType::P2TR => ScriptBuf::from_bytes(vec![
+            0x51, 0x20, // OP_1 PUSH32
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]),
+    }
+}
+
 impl Wallet {
     /// API to perform spending from wallet UTXOs, including descriptor coins and swap coins.
     ///
@@ -56,11 +79,11 @@ impl Wallet {
         &mut self,
         feerate: f64,
         destination: Destination,
-        coins_to_spend: &[(ListUnspentResultEntry, UTXOSpendInfo)],
+        coins_to_spend: &[(Utxo, UTXOSpendInfo)],
     ) -> Result<Transaction, WalletError> {
         log::info!("Creating Direct-Spend from Wallet.");
 
-        let mut coins = Vec::<(ListUnspentResultEntry, UTXOSpendInfo)>::new();
+        let mut coins = Vec::<(Utxo, UTXOSpendInfo)>::new();
 
         for coin in coins_to_spend {
             // filter all contract and fidelity utxos.
@@ -160,8 +183,8 @@ impl Wallet {
     /// Creates a [`Transaction`] spending given UTXOs to a [`Destination`] with fee calculated from `feerate`.
     #[hotpath::measure]
     pub fn spend_coins(
-        &self,
-        coins: &[(ListUnspentResultEntry, UTXOSpendInfo)],
+        &mut self,
+        coins: &[(Utxo, UTXOSpendInfo)],
         destination: Destination,
         feerate: f64,
     ) -> Result<Transaction, WalletError> {
@@ -184,7 +207,7 @@ impl Wallet {
             match spend_info {
                 UTXOSpendInfo::SeedCoin { .. } | UTXOSpendInfo::SweptCoin { .. } => {
                     tx.input.push(TxIn {
-                        previous_output: OutPoint::new(utxo_data.txid, utxo_data.vout),
+                        previous_output: OutPoint::new(utxo_data.txid(), utxo_data.vout()),
                         sequence: Sequence::ZERO,
                         witness: Witness::new(),
                         script_sig: ScriptBuf::new(),
@@ -194,7 +217,7 @@ impl Wallet {
                 }
                 UTXOSpendInfo::IncomingSwapCoin { .. } | UTXOSpendInfo::OutgoingSwapCoin { .. } => {
                     tx.input.push(TxIn {
-                        previous_output: OutPoint::new(utxo_data.txid, utxo_data.vout),
+                        previous_output: OutPoint::new(utxo_data.txid(), utxo_data.vout()),
                         sequence: Sequence::ZERO,
                         witness: Witness::new(),
                         script_sig: ScriptBuf::new(),
@@ -315,16 +338,19 @@ impl Wallet {
                     };
                     tx.output.push(txout);
                 }
-                // Use specified change address type, default to P2WPKH
+                // Use specified change address type, default to P2WPKH.
+                // We *don't* reveal the change spk yet: it's only revealed if the change
+                // output is actually added (i.e. above dust). Otherwise revealing here
+                // would burn a fresh HD index every time change happens to fall below
+                // dust. Build a same-sized dummy spk for fee estimation only.
                 let change_type = change_address_type;
-                let internal_spk =
-                    self.get_next_internal_addresses(1, change_type)?[0].script_pubkey();
-                let minimal_nondust = internal_spk.minimal_non_dust();
+                let dummy_change_spk = dummy_change_spk(change_type);
+                let minimal_nondust = dummy_change_spk.minimal_non_dust();
 
                 let mut tx_wchange = tx.clone();
                 tx_wchange.output.push(TxOut {
                     value: Amount::ZERO, // Adjusted later
-                    script_pubkey: internal_spk.clone(),
+                    script_pubkey: dummy_change_spk,
                 });
 
                 let base_wchange = tx_wchange.base_size();
@@ -350,6 +376,9 @@ impl Wallet {
                     };
 
                 if remaining_wchange > minimal_nondust {
+                    // Now we know we'll add a change output; reveal the real internal spk.
+                    let internal_spk =
+                        self.get_next_internal_addresses(1, change_type)?[0].script_pubkey();
                     tx.output.push(TxOut {
                         script_pubkey: internal_spk,
                         value: remaining_wchange,
@@ -392,7 +421,7 @@ impl Wallet {
 
                     for (utxo, _) in new_utxos {
                         tx.input.push(TxIn {
-                            previous_output: OutPoint::new(utxo.txid, utxo.vout),
+                            previous_output: OutPoint::new(utxo.txid(), utxo.vout()),
                             sequence: Sequence::ZERO,
                             witness: Witness::new(),
                             script_sig: ScriptBuf::new(),

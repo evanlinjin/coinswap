@@ -2,12 +2,9 @@
 //!
 //! Wallet data is currently written in unencrypted CBOR files which are not directly human readable.
 
-use crate::{
-    security::{encrypt_struct, load_sensitive_struct, KeyMaterial, SerdeCbor},
-    wallet::UTXOSpendInfo,
-};
+use crate::security::{encrypt_struct, load_sensitive_struct, KeyMaterial, SerdeCbor};
 
-use super::{error::WalletError, fidelity::FidelityBond};
+use super::{chain::BdkChangeSet, error::WalletError, fidelity::FidelityBond};
 
 use bitcoin::{bip32::Xpriv, Network, OutPoint, ScriptBuf};
 use serde::{Deserialize, Serialize};
@@ -20,10 +17,10 @@ use std::{
 
 use super::swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin};
 
-use bitcoind::bitcoincore_rpc::bitcoincore_rpc_json::ListUnspentResultEntry;
-
 /// Address type supported by the wallet for HD address generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 pub enum AddressType {
     /// BIP-84 Native SegWit (P2WPKH)
     #[default]
@@ -41,8 +38,6 @@ pub(crate) struct WalletStore {
     pub(crate) network: Network,
     /// The master key for the wallet.
     pub(super) master_key: Xpriv,
-    /// The external index for the wallet.
-    pub(super) external_index: u32,
     /// The maximum size for an offer in the wallet.
     pub(crate) offer_maxsize: u64,
     /// Map of swap_id to incoming swapcoins.
@@ -58,13 +53,17 @@ pub(crate) struct WalletStore {
     pub(crate) swept_incoming_swapcoins: HashSet<ScriptBuf>,
     /// Map for all the fidelity bond information.
     pub(crate) fidelity_bond: HashMap<u32, FidelityBond>,
-    pub(super) last_synced_height: Option<u64>,
-
     pub(super) wallet_birthday: Option<u64>,
 
-    /// Maps transaction outpoints to their associated UTXO and spend information.
-    #[serde(default)] // Ensures deserialization works if `utxo_cache` is missing
-    pub(super) utxo_cache: HashMap<OutPoint, (ListUnspentResultEntry, UTXOSpendInfo)>,
+    /// Persisted BDK chain + indexed-tx-graph change sets driving wallet sync.
+    #[serde(default)]
+    pub(super) bdk: BdkChangeSet,
+
+    /// UTXOs the wallet has locked locally (replaces Core wallet's lock_unspent).
+    /// Locks are best-effort and do not persist meaning across restarts of the node;
+    /// they are persisted alongside the wallet so a process restart preserves them.
+    #[serde(default)]
+    pub(super) locked_outpoints: HashSet<OutPoint>,
 }
 
 impl WalletStore {
@@ -81,7 +80,6 @@ impl WalletStore {
             file_name,
             network,
             master_key,
-            external_index: 0,
             offer_maxsize: 0,
             incoming_swapcoins: HashMap::new(),
             outgoing_swapcoins: HashMap::new(),
@@ -89,9 +87,9 @@ impl WalletStore {
             prevout_to_contract_map: HashMap::new(),
             swept_incoming_swapcoins: HashSet::new(),
             fidelity_bond: HashMap::new(),
-            last_synced_height: None,
             wallet_birthday,
-            utxo_cache: HashMap::new(),
+            bdk: BdkChangeSet::default(),
+            locked_outpoints: HashSet::new(),
         };
 
         std::fs::create_dir_all(path.parent().expect("Path should NOT be root!"))?;

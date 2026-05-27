@@ -9,7 +9,20 @@ use crate::{
     wallet::{AddressType, Destination, RPCConfig, Wallet, WalletBackup, WalletError},
 };
 use bitcoin::{Amount, OutPoint, Txid};
-use bitcoind::bitcoincore_rpc::{json::ListTransactionResult, RpcApi};
+use serde::{Deserialize, Serialize};
+
+/// A wallet-owned summary record of an incoming transaction. Replaces the bitcoincore-rpc
+/// `ListTransactionResult` shape that the wallet used to return when Bitcoin Core was the
+/// UTXO source. Carries only the fields the GUI actually surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IncomingTx {
+    /// The transaction id.
+    pub txid: Txid,
+    /// Sum of values paid to scripts the wallet owns in this tx.
+    pub amount: Amount,
+    /// Confirmations of the tx (0 if unconfirmed).
+    pub confirmations: u32,
+}
 use std::path::{Path, PathBuf};
 
 pub use super::report::{
@@ -120,13 +133,73 @@ impl Wallet {
         }
     }
 
-    /// Returns a list of recent Incoming Transactions (bydefault last 10)
+    /// Returns a list of recent incoming transactions to the wallet (by default last 10).
+    ///
+    /// A transaction is "incoming" if any of its outputs pays a script the wallet
+    /// recognizes as an HD seed coin or a previously-swept incoming-swap coin. Walks the
+    /// full canonical tx history (including transactions whose outputs have since been
+    /// spent), sorted most-recent first.
     pub fn get_transactions(
         &self,
         count: Option<usize>,
         skip: Option<usize>,
-    ) -> Result<Vec<ListTransactionResult>, WalletError> {
-        Ok(self.rpc.list_transactions(None, count, skip, Some(true))?)
+    ) -> Result<Vec<IncomingTx>, WalletError> {
+        use bdk_chain::{CanonicalizationParams, ChainPosition};
+
+        let count = count.unwrap_or(10);
+        let skip = skip.unwrap_or(0);
+
+        let tip = self.bdk.chain.tip();
+        let tip_height = tip.height();
+        let view = self.bdk.graph.canonical_view(
+            &self.bdk.chain,
+            tip.block_id(),
+            CanonicalizationParams::default(),
+        );
+
+        // Walk every canonical tx; keep any tx whose outputs pay one of our seed or swept
+        // spks, summing the value paid in.
+        let mut rows: Vec<(u32, IncomingTx)> = Vec::new();
+        for canonical_tx in view.txs() {
+            let mut owned_total = Amount::ZERO;
+            for txout in canonical_tx.tx.output.iter() {
+                let spk = &txout.script_pubkey;
+                let is_owned = self.bdk.keychain_of_spk(spk).is_some()
+                    || self.store.swept_incoming_swapcoins.contains(spk);
+                if is_owned {
+                    owned_total += txout.value;
+                }
+            }
+            if owned_total == Amount::ZERO {
+                continue;
+            }
+
+            let (confirmations, sort_height) = match &canonical_tx.pos {
+                ChainPosition::Confirmed { anchor, .. } => {
+                    let h = anchor.block_id.height;
+                    (tip_height.saturating_sub(h) + 1, h)
+                }
+                // Unconfirmed → sort to the top (u32::MAX height-key).
+                ChainPosition::Unconfirmed { .. } => (0_u32, u32::MAX),
+            };
+            rows.push((
+                sort_height,
+                IncomingTx {
+                    txid: canonical_tx.txid,
+                    amount: owned_total,
+                    confirmations,
+                },
+            ));
+        }
+
+        // Sort most-recent first (highest block height → top; unconfirmed first).
+        rows.sort_by_key(|(h, _)| std::cmp::Reverse(*h));
+        Ok(rows
+            .into_iter()
+            .map(|(_, tx)| tx)
+            .skip(skip)
+            .take(count)
+            .collect())
     }
 
     /// Sends specified Amount of Satoshis to an External Address

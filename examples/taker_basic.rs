@@ -188,7 +188,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !utxos.is_empty() {
             println!(
                 "  Sample UTXO: {} ({} BTC)",
-                utxos[0].txid,
+                utxos[0].txid(),
                 utxos[0].amount.to_btc()
             );
         }

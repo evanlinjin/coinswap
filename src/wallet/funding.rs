@@ -8,8 +8,6 @@ use bitcoin::{
     Address, Amount, OutPoint, Transaction,
 };
 
-use bitcoind::bitcoincore_rpc::RpcApi;
-
 use crate::{utill::calculate_fee_sats, wallet::Destination};
 
 use super::Wallet;
@@ -136,7 +134,7 @@ impl Wallet {
         excluded_outpoints: Option<Vec<OutPoint>>,
     ) -> Result<CreateFundingTxesResult, WalletError> {
         // Unlock all unspent UTXOs
-        self.rpc.unlock_unspent_all()?;
+        self.unlock_all_outpoints();
 
         // Unlock all unspent UTXOs && Lock all unspendable UTXOs
         self.lock_unspendable_utxos()?;
@@ -157,11 +155,11 @@ impl Wallet {
 
             let outpoints: Vec<OutPoint> = selected_utxo
                 .iter()
-                .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+                .map(|(utxo, _)| OutPoint::new(utxo.txid(), utxo.vout()))
                 .collect();
 
             // // Lock the selected UTXOs immediately after selection
-            self.rpc.lock_unspent(&outpoints)?;
+            self.lock_outpoints(&outpoints);
 
             // Store the locked UTXOs for later unlocking in case of error
             locked_utxos.extend(outpoints);
@@ -201,7 +199,7 @@ impl Wallet {
             })
         })();
 
-        self.rpc.unlock_unspent_all()?;
+        self.unlock_all_outpoints();
 
         result
     }
@@ -219,7 +217,7 @@ impl Wallet {
         let output_values = Wallet::generate_amount_fractions(destinations.len(), coinswap_amount)?;
 
         // Flow of Lock Step 1. Unlock all unspent UTXOs
-        self.rpc.unlock_unspent_all()?;
+        self.unlock_all_outpoints();
 
         // FLow of Lock Step 2. Lock all unspendable UTXOs
         self.lock_unspendable_utxos()?;
@@ -242,10 +240,10 @@ impl Wallet {
 
                 let outpoints: Vec<OutPoint> = selected_utxo
                     .iter()
-                    .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+                    .map(|(utxo, _)| OutPoint::new(utxo.txid(), utxo.vout()))
                     .collect();
                 // Flow of Lock Step 3. Lock the selected UTXOs immediately after selection
-                self.rpc.lock_unspent(&outpoints)?;
+                self.lock_outpoints(&outpoints);
                 // Flow of Lock Step 4. Store the locked UTXOs for later unlocking in case of error
                 locked_utxos.extend(outpoints);
 
@@ -285,7 +283,7 @@ impl Wallet {
             })
         })();
 
-        self.rpc.unlock_unspent_all()?;
+        self.unlock_all_outpoints();
 
         result
     }

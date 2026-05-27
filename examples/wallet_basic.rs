@@ -183,7 +183,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Show wallet state information
     println!("\nWallet State:");
-    let external_index = *wallet.get_external_index();
+    let external_index = wallet.get_external_index();
     println!("  External address index: {external_index}");
 
     // Demonstrate UTXO management
@@ -218,7 +218,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for (utxo, spend_info) in selected_utxos.iter().take(3) {
                 println!(
                     "    UTXO: {} ({} BTC, type: {})",
-                    utxo.txid,
+                    utxo.txid(),
                     utxo.amount.to_btc(),
                     spend_info
                 );
@@ -285,7 +285,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (utxo, spend_info) in all_utxo_info.iter().take(3) {
         println!(
             "    {} {} BTC ({})",
-            utxo.txid,
+            utxo.txid(),
             utxo.amount.to_btc(),
             spend_info
         );

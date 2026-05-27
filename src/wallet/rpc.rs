@@ -1,17 +1,17 @@
-//! Manages connection with a Bitcoin Core RPC.
+//! Bitcoin Core RPC connection and BDK-backed wallet sync.
 //!
+//! The wallet talks to Bitcoin Core as a *node* only — it does not load a Core wallet.
+//! Block-by-block chain ingestion is driven by [`bdk_bitcoind_rpc::Emitter`], persisted
+//! into the wallet store as BDK `ChangeSet`s.
+
 use std::{convert::TryFrom, thread};
 
-use bitcoind::bitcoincore_rpc::{
-    json::{ListUnspentResultEntry, ScanningDetails},
-    Auth, Client, RpcApi,
-};
-use serde_json::{json, Value};
+use bdk_bitcoind_rpc::{Emitter, NO_EXPECTED_MEMPOOL_TXS};
+use bdk_chain::{local_chain::CannotConnectError, Merge};
+use bitcoind::bitcoincore_rpc::{Auth, Client, RpcApi};
+use serde_json::json;
 
-use crate::{utill::HEART_BEAT_INTERVAL, wallet::api::KeychainKind};
-
-use bitcoin::block::Header;
-use serde::Deserialize;
+use crate::utill::HEART_BEAT_INTERVAL;
 
 use super::{error::WalletError, Wallet};
 
@@ -22,7 +22,7 @@ pub struct RPCConfig {
     pub url: String,
     /// The bitcoin node authentication mechanism
     pub auth: Auth,
-    /// The wallet name in the bitcoin node, derive this from the descriptor.
+    /// Identifier used to scope the wallet's local files. Not used for routing RPC calls.
     pub wallet_name: String,
 }
 
@@ -41,44 +41,17 @@ impl Default for RPCConfig {
 impl TryFrom<&RPCConfig> for Client {
     type Error = WalletError;
     fn try_from(config: &RPCConfig) -> Result<Self, WalletError> {
+        // Talk to the node directly — no `/wallet/<name>` suffix; the wallet is BDK-owned.
         let rpc = Client::new(
-            format!(
-                "http://{}/wallet/{}",
-                config.url.as_str(),
-                config.wallet_name.as_str()
-            )
-            .as_str(),
+            format!("http://{}", config.url.as_str()).as_str(),
             config.auth.clone(),
         )?;
         Ok(rpc)
     }
 }
 
-fn list_wallet_dir(client: &Client) -> Result<Vec<String>, WalletError> {
-    #[derive(Deserialize)]
-    struct Name {
-        name: String,
-    }
-    #[derive(Deserialize)]
-    struct CallResult {
-        wallets: Vec<Name>,
-    }
-
-    let result: CallResult = client.call("listwalletdir", &[])?;
-    Ok(result.wallets.into_iter().map(|n| n.name).collect())
-}
-
-fn get_wallet_scanning_details(client: &Client) -> Result<Option<ScanningDetails>, WalletError> {
-    #[derive(Deserialize)]
-    struct WalletInfoScanningOnly {
-        scanning: Option<ScanningDetails>,
-    }
-
-    // Parse only the field we need so upstream schema removals (e.g. getwalletinfo v30 balance related fields removal)
-    // do not break deserialization.
-    let wallet_info: WalletInfoScanningOnly = client.call("getwalletinfo", &[])?;
-    Ok(wallet_info.scanning)
-}
+/// Persist the wallet to disk at most this often during a long sync.
+const PERSIST_EVERY_N_BLOCKS: u32 = 500;
 
 impl Wallet {
     /// Wrapper around Self::sync that also saves the wallet to disk.
@@ -93,105 +66,68 @@ impl Wallet {
         Ok(())
     }
 
-    /// Get all utxos tracked by the core rpc wallet.
-    fn get_all_utxo_from_rpc(&self) -> Result<Vec<ListUnspentResultEntry>, WalletError> {
-        self.rpc.unlock_unspent_all()?;
-        let all_utxos = self
-            .rpc
-            .list_unspent(Some(0), Some(9999999), None, None, None)?;
-        Ok(all_utxos)
-    }
-
-    /// Sync the wallet with the configured Bitcoin Core RPC.
+    /// Sync the wallet with the configured Bitcoin Core node via BDK's Emitter.
     fn sync(&mut self) -> Result<(), WalletError> {
-        // Create or load the watch-only bitcoin core wallet
-        let wallet_name = &self.store.file_name;
-        if self.rpc.list_wallets()?.contains(wallet_name) {
-            log::debug!("wallet already loaded: {wallet_name}");
-        } else if list_wallet_dir(&self.rpc)?.contains(wallet_name) {
-            self.rpc.load_wallet(wallet_name)?;
-            log::debug!("wallet loaded: {wallet_name}");
+        // Pick the floor `start_height` for the Emitter's fallback (used only when it
+        // can't find an agreement point between our LocalChain and Core's chain).
+        //
+        // * Fresh wallet (LocalChain still at genesis): jump to `wallet_birthday` to
+        //   skip ahead — the wallet is by definition not interested in anything below
+        //   its birthday.
+        // * Otherwise: floor at 0. The Emitter's normal happy path starts emitting from
+        //   our tip+1 anyway, so 0 has no cost in the common case; it only matters when
+        //   a deep reorg invalidates blocks below wallet_birthday on the new chain,
+        //   which would otherwise leave those blocks permanently unscanned.
+        let chain_tip_height = self.bdk.chain.tip().height();
+        let start_height = if chain_tip_height == 0 {
+            self.store.wallet_birthday.unwrap_or(0) as u32
         } else {
-            // pre-0.21 use legacy wallets
-            if self.rpc.version()? < 210_000 {
-                self.rpc
-                    .create_wallet(wallet_name, Some(true), None, None, None)?;
-            } else {
-                // We cannot use the api directly right now.
-                // https://github.com/rust-bitcoin/rust-bitcoincore-rpc/issues/225 is still open,
-                // We can update to api call after moving to new corepc crate.
-                let args = [
-                    Value::String(wallet_name.clone()),
-                    Value::Bool(true),  // Disable Private Keys
-                    Value::Bool(false), // Create a blank wallet
-                    Value::Null,        // Optional Passphrase
-                    Value::Bool(false), // Avoid Reuse
-                    Value::Bool(true),  // Descriptor Wallet
-                ];
-                let _: Value = self.rpc.call("createwallet", &args)?;
-            }
+            0
+        };
 
-            log::debug!("wallet created: {wallet_name}");
-        }
+        let last_cp = self.bdk.chain.tip();
+        let mut emitter = Emitter::new(&self.rpc, last_cp, start_height, NO_EXPECTED_MEMPOOL_TXS);
 
-        let descriptors_to_import = self.descriptors_to_import()?;
+        let mut blocks_since_persist: u32 = 0;
 
-        if descriptors_to_import.is_empty() {
-            return Ok(());
-        }
-
-        // Sometimes in test multiple wallet scans can occur at same time, resulting in error.
-        let mut last_synced_height = self
-            .store
-            .last_synced_height
-            .unwrap_or(0)
-            .max(self.store.wallet_birthday.unwrap_or(0));
-        let node_synced = self.rpc.get_block_count()?;
-
-        // If the chain is shorter than the wallet's last synced height (e.g. node
-        // restarted with a fresh chain or a reorg), reset to rescan from the start.
-        if last_synced_height > node_synced {
-            log::warn!(
-                "Wallet last_synced_height ({}) exceeds chain height ({}), resetting to 0",
-                last_synced_height,
-                node_synced
-            );
-            last_synced_height = 0;
-            self.store.last_synced_height = Some(0);
-        }
-
-        log::info!("Re-scanning Blockchain from:{last_synced_height} to:{node_synced}");
-
-        let block_hash = self.rpc.get_block_hash(last_synced_height)?;
-        let Header { time, .. } = self.rpc.get_block_header(&block_hash)?;
-
-        let _ = self.import_descriptors(&descriptors_to_import, Some(time), None);
-
-        // Returns when the scanning is completed
         loop {
-            match get_wallet_scanning_details(&self.rpc)? {
-                Some(ScanningDetails::Scanning { duration, .. }) => {
-                    // Todo: Show scan progress
-                    log::info!("Scanning for {}s", duration);
-                    thread::sleep(HEART_BEAT_INTERVAL);
-                    continue;
-                }
-                Some(ScanningDetails::NotScanning(_)) => {
-                    log::info!("Scanning completed");
-                    break;
-                }
-                None => {
-                    log::info!("No scan is in progress or Scanning completed");
-                    break;
-                }
+            let event = match emitter.next_block() {
+                Ok(Some(e)) => e,
+                Ok(None) => break,
+                Err(e) => return Err(WalletError::Rpc(e)),
+            };
+            let height = event.block_height();
+
+            let chain_cs = self.bdk.chain.apply_update(event.checkpoint).map_err(
+                |e: CannotConnectError| {
+                    WalletError::General(format!("LocalChain::apply_update: {e}"))
+                },
+            )?;
+            let graph_cs = self.bdk.graph.apply_block_relevant(&event.block, height);
+
+            self.store.bdk.local_chain.merge(chain_cs);
+            self.store.bdk.indexed_tx_graph.merge(graph_cs);
+
+            blocks_since_persist += 1;
+
+            if blocks_since_persist >= PERSIST_EVERY_N_BLOCKS {
+                self.save_to_disk()?;
+                blocks_since_persist = 0;
             }
         }
-        self.store.last_synced_height = Some(node_synced);
-        self.update_utxo_cache(self.get_all_utxo_from_rpc()?);
 
-        let max_external_index = self.find_hd_next_index(KeychainKind::External)?;
-        self.store.external_index = max_external_index;
+        // Mempool ingest.
+        let mempool = emitter.mempool().map_err(WalletError::Rpc)?;
+        if !mempool.update.is_empty() {
+            let mempool_cs = self
+                .bdk
+                .graph
+                .batch_insert_relevant_unconfirmed(mempool.update);
+            self.store.bdk.indexed_tx_graph.merge(mempool_cs);
+        }
+
         self.refresh_offer_maxsize_cache()?;
+
         Ok(())
     }
 
@@ -202,40 +138,6 @@ impl Wallet {
             log::error!("Blockchain sync failed. Retrying. | {e:?}");
             thread::sleep(HEART_BEAT_INTERVAL);
         }
-    }
-
-    /// Import watch addresses into core wallet. Does not check if the address was already imported.
-    /// Scans blocks from a given timestamp.
-    pub(crate) fn import_descriptors(
-        &self,
-        descriptors_to_import: &[String],
-        time: Option<u32>,
-        address_label: Option<String>,
-    ) -> Result<(), WalletError> {
-        let address_label = address_label.unwrap_or(self.get_core_wallet_label());
-
-        // Offset by +2h because import_descriptors applies a default -2h to the timestamp
-        let time_stamp = time.map(|t| json!(t + 7200)).unwrap_or(json!("now"));
-
-        let import_requests = descriptors_to_import
-            .iter()
-            .map(|desc| {
-                if desc.contains("/*") {
-                    return json!({
-                        "timestamp": time_stamp,
-                        "desc": desc,
-                        "range": (self.get_addrss_import_count() - 1)
-                    });
-                }
-                json!({
-                    "timestamp": time_stamp,
-                    "desc": desc,
-                    "label": address_label
-                })
-            })
-            .collect();
-        let _res: Vec<Value> = self.rpc.call("importdescriptors", &[import_requests])?;
-        Ok(())
     }
 
     /// Verify the SPV proof for a transaction.

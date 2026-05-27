@@ -119,11 +119,13 @@ impl Wallet {
             &restored_enc_material,
         )?;
 
+        let bdk = Wallet::build_bdk_chain(&store)?;
         let mut tmp_wallet = Wallet {
             rpc,
             wallet_file_path: wallet_path.to_path_buf(),
             store,
             store_enc_material: restored_enc_material,
+            bdk,
         };
         tmp_wallet.sync_and_save()?;
 

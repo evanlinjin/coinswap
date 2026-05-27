@@ -144,8 +144,11 @@ fn test_address_grouping_behavior() {
 
     println!("\n=== Strategic Address Grouping Test Cases ===");
 
-    // Test each scenario to validate the smart address grouping algorithm
-    for &(target_btc, expected_utxos, case_name, expected_behavior) in TEST_CASES {
+    // Test each scenario to validate the smart address grouping algorithm.
+    // `_expected_utxos` is kept in TEST_CASES as documentation of one historical
+    // valid selection but is no longer asserted on (different selectors pick
+    // different valid sets).
+    for &(target_btc, _expected_utxos, case_name, expected_behavior) in TEST_CASES {
         println!("\n--- {case_name} ---");
         println!("Target amount: {target_btc} BTC");
         println!("Expected: {expected_behavior}");
@@ -168,20 +171,14 @@ fn test_address_grouping_behavior() {
         println!("TOTAL SELECTED: {total_selected} BTC");
         println!("UTXO COUNT: {}", selected_utxos.len());
 
-        // Convert expected UTXOs to sorted vec for comparison
-        let mut expected_sorted = expected_utxos.to_vec();
-        expected_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-        let mut selected_sorted = selected_amounts;
-        selected_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-        // Assert exact UTXO match
-        assert_eq!(
-            selected_sorted, expected_sorted,
-            "UTXO mismatch! Expected {expected_sorted:?}, got {selected_sorted:?}"
-        );
-
-        // Additional validation: ensure selection can actually cover target + reasonable fees
+        // The previous assertion `selected == expected_utxos` tested implementation
+        // detail (the prior selector's exact picks). Two valid coin selectors can
+        // pick different valid UTXO sets for the same target. We just assert the
+        // basic correctness invariant: selection covers target + reasonable fees.
+        // The atomic-reused-groups property is verified directly in
+        // `wallet::api::selector_tests` (which has access to outpoints, so it can
+        // distinguish address-mates without confusing same-value UTXOs at
+        // different addresses).
         let reasonable_fee_estimate = 0.001;
         assert!(
             total_selected >= target_btc + reasonable_fee_estimate,
@@ -189,7 +186,7 @@ fn test_address_grouping_behavior() {
             total_selected,
             target_btc
         );
-        println!("Test passed - correct UTXOs selected");
+        println!("Test passed - selection covers target");
     }
 
     println!("\n=== Test Completed Successfully ===");
@@ -348,8 +345,25 @@ fn test_separated_utxo_coin_selection() {
             } => {
                 println!("Correctly failed with InsufficientFund");
                 println!("   Available: {available} sats, Required: {required} sats");
-                assert_eq!(*required, target_3.to_sat() + 424); // Should include 424 sats estimated fee
+                // The exact `required` value depends on the coin selector's fee
+                // accounting and would couple this test to a specific algorithm.
+                // The important invariants are:
+                //   1. required > target (some fee is included)
+                //   2. available is the swap balance (regular/swap separation)
+                //   3. required > available (we don't have enough)
+                assert!(
+                    *required > target_3.to_sat(),
+                    "required {} should exceed target {} (includes fee budget)",
+                    required,
+                    target_3.to_sat(),
+                );
                 assert_eq!(*available, balances.swap.to_sat());
+                assert!(
+                    *required > *available,
+                    "required {} should exceed available {} (this is an insufficient-funds error)",
+                    required,
+                    available,
+                );
                 println!("Confirmed: Only swap balance reported in insufficient funds error");
             }
             _ => panic!(
@@ -469,7 +483,7 @@ fn test_manual_coinselection() {
             all_utxos
                 .iter()
                 .find(|utxo| utxo.amount.to_sat() == target_amount)
-                .map(|utxo| OutPoint::new(utxo.txid, utxo.vout))
+                .map(|utxo| OutPoint::new(utxo.txid(), utxo.vout()))
         })
         .collect();
 
@@ -519,7 +533,7 @@ fn test_manual_coinselection() {
         .unwrap()
         .list_all_utxo()
         .iter()
-        .map(|utxo| OutPoint::new(utxo.txid, utxo.vout))
+        .map(|utxo| OutPoint::new(utxo.txid(), utxo.vout()))
         .collect();
 
     let manual_utxos_spent = manually_selected_utxos
@@ -650,14 +664,14 @@ fn test_manual_coinselection() {
             "R" => {
                 let regular_outpoints: Vec<OutPoint> = regular_utxos
                     .iter()
-                    .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+                    .map(|(utxo, _)| OutPoint::new(utxo.txid(), utxo.vout()))
                     .collect();
                 Some(regular_outpoints)
             }
             "S" => {
                 let swap_outpoints: Vec<OutPoint> = swept_utxos
                     .iter()
-                    .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+                    .map(|(utxo, _)| OutPoint::new(utxo.txid(), utxo.vout()))
                     .collect();
                 Some(swap_outpoints)
             }
@@ -665,11 +679,11 @@ fn test_manual_coinselection() {
                 let mixed_outpoints: Vec<OutPoint> = vec![
                     regular_utxos
                         .first()
-                        .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+                        .map(|(utxo, _)| OutPoint::new(utxo.txid(), utxo.vout()))
                         .unwrap(),
                     swept_utxos
                         .first()
-                        .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+                        .map(|(utxo, _)| OutPoint::new(utxo.txid(), utxo.vout()))
                         .unwrap(),
                 ];
                 Some(mixed_outpoints)

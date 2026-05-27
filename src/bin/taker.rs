@@ -382,7 +382,7 @@ fn main() -> Result<(), TakerError> {
                 Some(
                     coinswap::utill::interactive_select(wallet.list_all_utxo_spend_info(), amount)?
                         .iter()
-                        .map(|(utxo, _)| bitcoin::OutPoint::new(utxo.txid, utxo.vout))
+                        .map(|(utxo, _)| bitcoin::OutPoint::new(utxo.txid(), utxo.vout()))
                         .collect::<Vec<_>>(),
                 )
             } else {
@@ -460,7 +460,7 @@ fn main() -> Result<(), TakerError> {
                             target_amount,
                         )?
                         .iter()
-                        .map(|(utxo, _)| bitcoin::OutPoint::new(utxo.txid, utxo.vout))
+                        .map(|(utxo, _)| bitcoin::OutPoint::new(utxo.txid(), utxo.vout()))
                         .collect::<Vec<_>>(),
                     )
                 } else {
