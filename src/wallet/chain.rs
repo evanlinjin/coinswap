@@ -254,11 +254,6 @@ impl BdkChain {
         Ok(Self { chain, graph })
     }
 
-    /// Script for the given (keychain, index) pair, deriving lazily within the lookahead window.
-    pub(crate) fn spk_at(&self, keychain: SeedKeychain, index: u32) -> Option<ScriptBuf> {
-        self.graph.index.seed.spk_at_index(keychain, index)
-    }
-
     /// Reverse lookup: given a spk, return the (keychain, index) that derived it, if any.
     pub(crate) fn keychain_of_spk(&self, spk: &bitcoin::Script) -> Option<(SeedKeychain, u32)> {
         self.graph

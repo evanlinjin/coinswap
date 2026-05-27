@@ -717,7 +717,10 @@ impl Wallet {
         let mut discarded = Vec::new();
 
         for swap_id in to_recover {
-            if let Some(swapcoin) = self.store.outgoing_swapcoins.get(&swap_id) {
+            // Clone so we don't hold an immutable borrow of self.store across the
+            // &mut self call to create_timelock_recovery_tx below.
+            let swapcoin_clone = self.store.outgoing_swapcoins.get(&swap_id).cloned();
+            if let Some(swapcoin) = swapcoin_clone.as_ref() {
                 // Ensure the contract tx is on-chain before attempting timelock spend.
                 let contract_txid = swapcoin.contract_tx.compute_txid();
                 let contract_vout = swapcoin.get_contract_output_vout();
@@ -937,7 +940,7 @@ impl Wallet {
     /// Create a recovery transaction for a timelocked outgoing swapcoin.
     #[hotpath::measure]
     fn create_timelock_recovery_tx(
-        &self,
+        &mut self,
         swapcoin: &super::swapcoin::OutgoingSwapCoin,
         fee_rate: f64,
     ) -> Result<bitcoin::Transaction, WalletError> {
@@ -1492,31 +1495,33 @@ impl Wallet {
     }
 
     /// Gets the next `count` internal addresses from the HD keychain.
+    ///
+    /// Each call reveals a fresh, never-issued index — back-to-back calls return
+    /// distinct addresses even between syncs. The resulting `KeychainTxOutIndex`
+    /// `ChangeSet` is merged into the persisted store so the revealed counter
+    /// survives a reload (crash-safe).
     pub fn get_next_internal_addresses(
-        &self,
+        &mut self,
         count: u32,
         address_type: AddressType,
     ) -> Result<Vec<Address>, WalletError> {
+        use bdk_chain::Merge;
         let kc = SeedKeychain {
             address_type,
             kind: KeychainKind::Internal,
         };
-        // Internal addresses are stateless from the caller's perspective — find the
-        // next unused index from BDK's view.
-        let (start, _) =
-            self.bdk.graph.index.seed.next_index(kc).ok_or_else(|| {
-                WalletError::General("internal keychain not registered".to_string())
-            })?;
-
         let mut addresses = Vec::with_capacity(count as usize);
-        for i in 0..count {
-            let idx = start + i;
-            let spk = self.bdk.spk_at(kc, idx).ok_or_else(|| {
-                WalletError::General(format!(
-                    "BDK could not derive internal spk for {:?} at index {idx}",
-                    kc
-                ))
-            })?;
+        for _ in 0..count {
+            let ((_, spk), cs) =
+                self.bdk
+                    .graph
+                    .index
+                    .seed
+                    .reveal_next_spk(kc)
+                    .ok_or_else(|| {
+                        WalletError::General(format!("BDK keychain not registered: {kc:?}"))
+                    })?;
+            self.store.bdk.indexed_tx_graph.indexer.merge(cs);
             let addr = Address::from_script(&spk, self.store.network)
                 .map_err(|e| WalletError::General(format!("address from spk: {e}")))?;
             addresses.push(addr);
